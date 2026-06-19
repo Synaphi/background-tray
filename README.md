@@ -1,3 +1,5 @@
+![Background Tray — keep Obsidian in the system tray](assets/banner.jpg)
+
 # Background Tray
 
 Keep Obsidian running in the system tray instead of quitting when you close the window. A robust, modern reimplementation of the (now unmaintained) `obsidian-tray`, built for Obsidian / Electron in 2026.
