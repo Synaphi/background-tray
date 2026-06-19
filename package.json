@@ -1,6 +1,6 @@
 {
 	"name": "background-tray",
-	"version": "1.0.1",
+	"version": "1.0.2",
 	"description": "Keep Obsidian running in the system tray instead of quitting when the window is closed.",
 	"main": "main.js",
 	"scripts": {
