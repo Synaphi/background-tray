@@ -1,0 +1,19 @@
+# Dependencies
+node_modules/
+
+# Build output (release 시 GitHub Release 에 개별 첨부)
+main.js
+*.js.map
+
+# Logs
+*.log
+npm-debug.log*
+
+# IDE / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Misc
+*.tgz
+data.json
