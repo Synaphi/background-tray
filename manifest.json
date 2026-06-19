@@ -1,9 +1,9 @@
 {
 	"id": "background-tray",
 	"name": "Background Tray",
-	"version": "1.0.2",
+	"version": "1.0.3",
 	"minAppVersion": "1.4.0",
-	"description": "Keep Obsidian running in the system tray instead of quitting when the window is closed.",
+	"description": "Keep running in the system tray instead of quitting when you close the window.",
 	"author": "Synaphi",
 	"authorUrl": "https://github.com/synaphi",
 	"fundingUrl": "https://paypal.me/synaphi",
