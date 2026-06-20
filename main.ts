@@ -9,6 +9,75 @@ import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 const DEFAULT_TRAY_ICON =
 	"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR42mOosXr7nxLMMGrAqAGjBgwXAwBGOKIfCm+pOwAAAABJRU5ErkJggg==";
 
+// ── Electron(렌더러에서 접근하는 main 프로세스 API) 최소 타입 ──────────
+// any 대신 실제로 사용하는 멤버만 좁게 선언해 unsafe-access 계열 경고를 없앤다.
+interface ElectronEvent {
+	preventDefault(): void;
+	returnValue?: boolean;
+}
+
+type ElectronListener = (...args: never[]) => void;
+
+interface NativeImageLike {
+	isEmpty(): boolean;
+}
+
+interface ElectronWindow {
+	id: number;
+	hide(): void;
+	show(): void;
+	focus(): void;
+	restore(): void;
+	close(): void;
+	isVisible(): boolean;
+	isMinimized(): boolean;
+	isDestroyed(): boolean;
+	setSkipTaskbar(skip: boolean): void;
+	on(event: "close", listener: (e: ElectronEvent) => void): void;
+	removeListener(event: "close", listener: ElectronListener): void;
+}
+
+interface ElectronTray {
+	setToolTip(tooltip: string): void;
+	setContextMenu(menu: unknown): void;
+	on(event: "click", listener: () => void): void;
+	destroy(): void;
+}
+
+interface MenuItemTemplate {
+	label?: string;
+	type?: string;
+	click?: () => void;
+}
+
+interface ElectronApp {
+	prependListener(event: "second-instance", listener: () => void): void;
+	on(
+		event: "browser-window-created",
+		listener: (e: ElectronEvent, w: ElectronWindow) => void
+	): void;
+	removeListener(event: string, listener: ElectronListener): void;
+	quit(): void;
+	relaunch(): void;
+	exit(code: number): void;
+	getFileIcon(
+		path: string,
+		options: { size: string }
+	): Promise<NativeImageLike>;
+	dock?: { show?: () => void };
+}
+
+interface ElectronRemote {
+	app: ElectronApp;
+	getCurrentWindow(): ElectronWindow;
+	Tray: new (icon: NativeImageLike) => ElectronTray;
+	Menu: { buildFromTemplate(template: MenuItemTemplate[]): unknown };
+	nativeImage: {
+		createFromPath(path: string): NativeImageLike;
+		createFromDataURL(dataUrl: string): NativeImageLike;
+	};
+}
+
 interface BackgroundTraySettings {
 	runInBackground: boolean;
 	createTrayIcon: boolean;
@@ -26,16 +95,25 @@ const DEFAULT_SETTINGS: BackgroundTraySettings = {
 };
 
 // 렌더러에서 Electron main 프로세스 모듈을 가져온다. 빌드별 경로 차이 → fallback.
-function getRemote(): any {
+// require() 리터럴 대신 window.require 를 통해 가져와 정적 import 규칙을 피한다.
+function getRemote(): ElectronRemote | null {
+	if (typeof window === "undefined") return null;
+	const electronRequire = (
+		window as unknown as { require?: (id: string) => unknown }
+	).require;
+	if (typeof electronRequire !== "function") return null;
 	try {
-		return require("@electron/remote");
-	} catch (_) {
-		/* legacy 시도 */
+		return electronRequire("@electron/remote") as ElectronRemote;
+	} catch {
+		/* @electron/remote 미가용 → legacy 시도 */
 	}
 	try {
-		return (require("electron") as any).remote;
-	} catch (_) {
-		/* 접근 불가 */
+		const legacy = electronRequire("electron") as {
+			remote?: ElectronRemote;
+		};
+		return legacy.remote ?? null;
+	} catch {
+		/* Electron 접근 불가 */
 	}
 	return null;
 }
@@ -43,13 +121,15 @@ function getRemote(): any {
 export default class BackgroundTrayPlugin extends Plugin {
 	settings!: BackgroundTraySettings;
 
-	private remote: any = null;
-	private win: any = null;
-	private tray: any = null;
-	private closeHandler: ((e: any) => void) | null = null;
-	private beforeUnloadHandler: ((e: any) => void) | null = null;
+	private remote: ElectronRemote | null = null;
+	private win: ElectronWindow | null = null;
+	private tray: ElectronTray | null = null;
+	private closeHandler: ((e: ElectronEvent) => void) | null = null;
+	private beforeUnloadHandler: ((e: BeforeUnloadEvent) => void) | null = null;
 	private secondInstanceHandler: (() => void) | null = null;
-	private windowCreatedHandler: ((event: any, w: any) => void) | null = null;
+	private windowCreatedHandler:
+		| ((event: ElectronEvent, w: ElectronWindow) => void)
+		| null = null;
 	private lastRelaunchAt = 0;
 	private reallyQuitting = false;
 
@@ -112,11 +192,15 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.destroyTray();
 		try {
 			this.win?.setSkipTaskbar(false);
-		} catch (_) {}
+		} catch {
+			/* 창 접근 불가 */
+		}
 		try {
 			// (mac) dock 복원
 			this.remote?.app?.dock?.show?.();
-		} catch (_) {}
+		} catch {
+			/* dock 없음 */
+		}
 		this.win = null;
 		this.remote = null;
 	}
@@ -126,13 +210,16 @@ export default class BackgroundTrayPlugin extends Plugin {
 	private registerBeforeUnload() {
 		if (typeof window === "undefined") return;
 		this.removeBeforeUnload(); // 중복 등록 가드
-		this.beforeUnloadHandler = (e: any) => {
+		this.beforeUnloadHandler = (e: BeforeUnloadEvent) => {
 			if (this.settings.runInBackground && !this.reallyQuitting) {
 				e.preventDefault();
-				e.returnValue = false; // Electron: 닫기 취소
+				// Electron: 닫기 취소 (returnValue 는 deprecated 타입 → 캐스트로 우회)
+				(e as { returnValue: boolean }).returnValue = false;
 				try {
 					this.win?.hide(); // 트레이로 숨김
-				} catch (_) {}
+				} catch {
+					/* 숨김 실패 무시 */
+				}
 			}
 		};
 		window.addEventListener("beforeunload", this.beforeUnloadHandler);
@@ -140,23 +227,27 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 	private removeBeforeUnload() {
 		if (typeof window !== "undefined" && this.beforeUnloadHandler) {
-			window.removeEventListener("beforeunload", this.beforeUnloadHandler);
+			window.removeEventListener(
+				"beforeunload",
+				this.beforeUnloadHandler
+			);
 		}
 		this.beforeUnloadHandler = null;
 	}
 
 	// ── 닫기 가로채기 ② window.on("close") (fallback) ─────────────────
 	private registerCloseInterception() {
-		if (!this.win) return;
+		const win = this.win;
+		if (!win) return;
 		this.removeCloseInterception(); // 중복 등록 가드
-		this.closeHandler = (e: any) => {
+		this.closeHandler = (e: ElectronEvent) => {
 			if (this.settings.runInBackground && !this.reallyQuitting) {
 				e.preventDefault();
-				this.win.hide();
+				win.hide();
 			}
 		};
 		try {
-			this.win.on("close", this.closeHandler);
+			win.on("close", this.closeHandler);
 		} catch (e) {
 			console.error("Background Tray: close 리스너 등록 실패", e);
 			this.closeHandler = null;
@@ -167,7 +258,9 @@ export default class BackgroundTrayPlugin extends Plugin {
 		if (this.win && this.closeHandler) {
 			try {
 				this.win.removeListener("close", this.closeHandler);
-			} catch (_) {}
+			} catch {
+				/* 이미 제거됨 */
+			}
 		}
 		this.closeHandler = null;
 	}
@@ -177,34 +270,48 @@ export default class BackgroundTrayPlugin extends Plugin {
 	// 보관함 선택창을 새로 띄운다(실측). → 우리는 기존 창을 복원하고, 직후 생성되는 그
 	// 선택창을 닫아 "기존 창 복귀"처럼 동작하게 한다. (Spec §4.6)
 	private registerSingleInstance() {
-		if (!this.remote || !this.win) return;
-		const app = this.remote.app;
-		if (!app || typeof app.prependListener !== "function") return;
+		const remote = this.remote;
+		const win = this.win;
+		if (!remote || !win) return;
+		const app = remote.app;
+		if (typeof app.prependListener !== "function") return;
 		this.removeSingleInstance(); // 중복 등록 가드
 
 		let myId = -1;
 		try {
-			myId = this.win.id;
-		} catch (_) {}
+			myId = win.id;
+		} catch {
+			/* id 접근 불가 */
+		}
 
 		this.secondInstanceHandler = () => {
 			if (!this.settings.focusOnRelaunch) return;
 			this.lastRelaunchAt = Date.now();
 			this.showWindow();
 		};
-		this.windowCreatedHandler = (_event: any, w: any) => {
+		this.windowCreatedHandler = (
+			_event: ElectronEvent,
+			w: ElectronWindow
+		) => {
 			if (!this.settings.focusOnRelaunch) return;
 			let id = -1;
 			try {
 				id = w.id;
-			} catch (_) {}
+			} catch {
+				/* id 접근 불가 */
+			}
 			if (id === myId) return; // 우리 창은 건드리지 않음
 			// second-instance 직후(짧은 창)에 생긴 새 창 = 보관함 선택창 → 닫는다.
-			if (this.lastRelaunchAt > 0 && Date.now() - this.lastRelaunchAt < 4000) {
-				setTimeout(() => {
+			if (
+				this.lastRelaunchAt > 0 &&
+				Date.now() - this.lastRelaunchAt < 4000
+			) {
+				window.setTimeout(() => {
 					try {
-						if (w && !w.isDestroyed()) w.close();
-					} catch (_) {}
+						if (!w.isDestroyed()) w.close();
+					} catch {
+						/* 이미 닫힘 */
+					}
 				}, 120);
 			}
 		};
@@ -222,12 +329,22 @@ export default class BackgroundTrayPlugin extends Plugin {
 		if (app) {
 			try {
 				if (this.secondInstanceHandler)
-					app.removeListener("second-instance", this.secondInstanceHandler);
-			} catch (_) {}
+					app.removeListener(
+						"second-instance",
+						this.secondInstanceHandler
+					);
+			} catch {
+				/* 이미 제거됨 */
+			}
 			try {
 				if (this.windowCreatedHandler)
-					app.removeListener("browser-window-created", this.windowCreatedHandler);
-			} catch (_) {}
+					app.removeListener(
+						"browser-window-created",
+						this.windowCreatedHandler
+					);
+			} catch {
+				/* 이미 제거됨 */
+			}
 		}
 		this.secondInstanceHandler = null;
 		this.windowCreatedHandler = null;
@@ -235,23 +352,28 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 	// ── 트레이 ───────────────────────────────────────────────────────
 	private async createTray() {
-		if (!this.remote) return;
+		const remote = this.remote;
+		if (!remote) return;
 		this.destroyTray(); // 중복 가드
 		try {
-			const { Tray, Menu } = this.remote;
-			const icon = await this.resolveTrayIcon();
+			const { Tray, Menu } = remote;
+			const icon = await this.resolveTrayIcon(remote);
 
-			this.tray = new Tray(icon);
-			this.tray.setToolTip(this.renderTooltip());
+			const tray = new Tray(icon);
+			this.tray = tray;
+			tray.setToolTip(this.renderTooltip());
 
 			const menu = Menu.buildFromTemplate([
 				{ label: "Show / Hide", click: () => this.toggleWindow() },
 				{ type: "separator" },
 				{ label: "Relaunch Obsidian", click: () => this.relaunch() },
-				{ label: "Quit completely", click: () => this.quitCompletely() },
+				{
+					label: "Quit completely",
+					click: () => this.quitCompletely(),
+				},
 			]);
-			this.tray.setContextMenu(menu);
-			this.tray.on("click", () => this.toggleWindow());
+			tray.setContextMenu(menu);
+			tray.on("click", () => this.toggleWindow());
 		} catch (e) {
 			console.error("Background Tray: 트레이 생성 실패", e);
 			new Notice("Background Tray: 트레이 아이콘 생성에 실패했습니다.");
@@ -260,20 +382,30 @@ export default class BackgroundTrayPlugin extends Plugin {
 	}
 
 	// 트레이 아이콘 결정: 커스텀 경로 → 실제 Obsidian 앱 아이콘 → fallback.
-	private async resolveTrayIcon(): Promise<any> {
-		const { nativeImage, app } = this.remote;
+	private async resolveTrayIcon(
+		remote: ElectronRemote
+	): Promise<NativeImageLike> {
+		const { nativeImage, app } = remote;
 		// 1) 사용자 지정 경로
 		if (this.settings.trayIconPath) {
 			try {
-				const c = nativeImage.createFromPath(this.settings.trayIconPath);
-				if (c && !c.isEmpty()) return c;
-			} catch (_) {}
+				const c = nativeImage.createFromPath(
+					this.settings.trayIconPath
+				);
+				if (!c.isEmpty()) return c;
+			} catch {
+				/* 경로 무효 → 다음 후보 */
+			}
 		}
 		// 2) 실제 Obsidian 실행 파일의 아이콘을 런타임에 추출 (번들 불필요)
 		try {
-			const img = await app.getFileIcon(process.execPath, { size: "normal" });
-			if (img && !img.isEmpty()) return img;
-		} catch (_) {}
+			const img = await app.getFileIcon(process.execPath, {
+				size: "normal",
+			});
+			if (!img.isEmpty()) return img;
+		} catch {
+			/* 아이콘 추출 실패 → fallback */
+		}
 		// 3) 마지막 수단 fallback
 		return nativeImage.createFromDataURL(DEFAULT_TRAY_ICON);
 	}
@@ -282,7 +414,9 @@ export default class BackgroundTrayPlugin extends Plugin {
 		if (this.tray) {
 			try {
 				this.tray.destroy();
-			} catch (_) {}
+			} catch {
+				/* 이미 파괴됨 */
+			}
 		}
 		this.tray = null;
 	}
@@ -297,10 +431,11 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 	// ── 창 동작 ──────────────────────────────────────────────────────
 	toggleWindow() {
-		if (!this.win) return;
+		const win = this.win;
+		if (!win) return;
 		try {
-			if (this.win.isVisible() && !this.win.isMinimized()) {
-				this.win.hide();
+			if (win.isVisible() && !win.isMinimized()) {
+				win.hide();
 			} else {
 				this.showWindow();
 			}
@@ -310,12 +445,15 @@ export default class BackgroundTrayPlugin extends Plugin {
 	}
 
 	showWindow() {
-		if (!this.win) return;
+		const win = this.win;
+		if (!win) return;
 		try {
-			if (this.win.isMinimized()) this.win.restore();
-			this.win.show();
-			this.win.focus();
-		} catch (_) {}
+			if (win.isMinimized()) win.restore();
+			win.show();
+			win.focus();
+		} catch {
+			/* 창 복귀 실패 무시 */
+		}
 	}
 
 	quitCompletely() {
@@ -327,7 +465,9 @@ export default class BackgroundTrayPlugin extends Plugin {
 			console.error("Background Tray: quit 실패", e);
 			try {
 				this.remote?.app?.quit();
-			} catch (_) {}
+			} catch {
+				/* 종료 실패 무시 */
+			}
 		}
 	}
 
@@ -342,7 +482,10 @@ export default class BackgroundTrayPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const data = (await this.loadData()) as
+			| Partial<BackgroundTraySettings>
+			| null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, data ?? {});
 	}
 
 	async saveSettings() {
@@ -352,7 +495,8 @@ export default class BackgroundTrayPlugin extends Plugin {
 	// 설정 변경 시 트레이를 다시 만들어 즉시 반영
 	async refreshTray() {
 		this.destroyTray();
-		if (this.remote && this.settings.createTrayIcon) await this.createTray();
+		if (this.remote && this.settings.createTrayIcon)
+			await this.createTray();
 	}
 }
 
@@ -372,21 +516,25 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 			.setName("Run in background")
 			.setDesc("창을 닫아도 종료하지 않고 트레이로 숨깁니다.")
 			.addToggle((t) =>
-				t.setValue(this.plugin.settings.runInBackground).onChange(async (v) => {
-					this.plugin.settings.runInBackground = v;
-					await this.plugin.saveSettings();
-				})
+				t
+					.setValue(this.plugin.settings.runInBackground)
+					.onChange(async (v) => {
+						this.plugin.settings.runInBackground = v;
+						await this.plugin.saveSettings();
+					})
 			);
 
 		new Setting(containerEl)
 			.setName("Create tray icon")
 			.setDesc("시스템 트레이에 아이콘을 만듭니다. (좌클릭: 표시/숨김 토글)")
 			.addToggle((t) =>
-				t.setValue(this.plugin.settings.createTrayIcon).onChange(async (v) => {
-					this.plugin.settings.createTrayIcon = v;
-					await this.plugin.saveSettings();
-					await this.plugin.refreshTray();
-				})
+				t
+					.setValue(this.plugin.settings.createTrayIcon)
+					.onChange(async (v) => {
+						this.plugin.settings.createTrayIcon = v;
+						await this.plugin.saveSettings();
+						await this.plugin.refreshTray();
+					})
 			);
 
 		new Setting(containerEl)
@@ -395,15 +543,19 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 				"트레이에 숨은 상태에서 Obsidian을 다시 실행하면 새 보관함 선택창 대신 기존 창을 복원합니다."
 			)
 			.addToggle((t) =>
-				t.setValue(this.plugin.settings.focusOnRelaunch).onChange(async (v) => {
-					this.plugin.settings.focusOnRelaunch = v;
-					await this.plugin.saveSettings();
-				})
+				t
+					.setValue(this.plugin.settings.focusOnRelaunch)
+					.onChange(async (v) => {
+						this.plugin.settings.focusOnRelaunch = v;
+						await this.plugin.saveSettings();
+					})
 			);
 
 		new Setting(containerEl)
 			.setName("Tray icon image")
-			.setDesc("커스텀 트레이 아이콘의 절대 경로 (비우면 Obsidian 기본 아이콘, 16x16 권장).")
+			.setDesc(
+				"커스텀 트레이 아이콘의 절대 경로 (비우면 Obsidian 기본 아이콘, 16x16 권장)."
+			)
 			.addText((txt) =>
 				txt
 					.setPlaceholder("/path/to/icon.png")

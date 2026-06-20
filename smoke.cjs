@@ -25,18 +25,27 @@ const fakeWin = {
   show(){ this._visible=true; log.shown++; },
   focus(){ log.focused++; },
   isVisible(){ return this._visible; }, isMinimized(){ return this._min; }, restore(){ this._min=false; },
-  close(){ log.quit++; }, setSkipTaskbar(){},
+  close(){ log.quit++; }, setSkipTaskbar(){}, isDestroyed(){ return false; }, id:1,
 };
 class Tray { constructor(i){ this.icon=i; log.trayCreated++; } setToolTip(){} setContextMenu(){} on(){} destroy(){ log.trayDestroyed++; } }
 const Menu = { buildFromTemplate(t){ return {_t:t}; } };
 const nativeImage = { createFromPath(){ return {isEmpty(){return true;}}; }, createFromDataURL(){ return {isEmpty(){return false;}}; }, createEmpty(){ return {}; } };
-const remoteStub = { getCurrentWindow(){ return fakeWin; }, Tray, Menu, nativeImage, app:{ quit(){log.quit++;}, relaunch(){}, exit(){}, dock:{show(){}} } };
+const remoteStub = { getCurrentWindow(){ return fakeWin; }, Tray, Menu, nativeImage, app:{ quit(){log.quit++;}, relaunch(){}, exit(){}, dock:{show(){}}, async getFileIcon(){ return {isEmpty(){return true;}}; } } };
 
 Module._load = function(req, parent, isMain){
   if (req === "obsidian") return obsidianStub;
   if (req === "@electron/remote") return remoteStub;
   if (req === "electron") return { remote: remoteStub };
   return origLoad.apply(this, arguments);
+};
+
+// ── window 전역 stub ── 렌더러의 window.require / beforeunload / setTimeout 흉내.
+const _winListeners = {};
+global.window = {
+  require,
+  addEventListener(ev, fn){ (_winListeners[ev]=_winListeners[ev]||[]).push(fn); },
+  removeEventListener(ev, fn){ _winListeners[ev]=(_winListeners[ev]||[]).filter(f=>f!==fn); },
+  setTimeout: (fn, t) => setTimeout(fn, t),
 };
 
 const PluginClass = require("./main.js").default || require("./main.js");
