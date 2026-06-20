@@ -1,6 +1,6 @@
 {
 	"name": "background-tray",
-	"version": "1.0.4",
+	"version": "1.0.5",
 	"description": "Keep running in the system tray instead of quitting when you close the window.",
 	"main": "main.js",
 	"scripts": {
@@ -8,7 +8,12 @@
 		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
 		"version": "node version-bump.mjs && git add manifest.json versions.json"
 	},
-	"keywords": ["obsidian", "plugin", "tray", "electron"],
+	"keywords": [
+		"obsidian",
+		"plugin",
+		"tray",
+		"electron"
+	],
 	"author": "Synaphi",
 	"license": "MIT",
 	"devDependencies": {

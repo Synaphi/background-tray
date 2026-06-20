@@ -27,10 +27,19 @@ const fakeWin = {
   isVisible(){ return this._visible; }, isMinimized(){ return this._min; }, restore(){ this._min=false; },
   close(){ log.quit++; }, setSkipTaskbar(){}, isDestroyed(){ return false; }, id:1,
 };
-class Tray { constructor(i){ this.icon=i; log.trayCreated++; } setToolTip(){} setContextMenu(){} on(){} destroy(){ log.trayDestroyed++; } }
+class Tray { constructor(i){ this.icon=i; log.trayCreated++; } setToolTip(t){ log.tooltip=t; } setContextMenu(){} on(){} destroy(){ log.trayDestroyed++; } }
 const Menu = { buildFromTemplate(t){ return {_t:t}; } };
 const nativeImage = { createFromPath(){ return {isEmpty(){return true;}}; }, createFromDataURL(){ return {isEmpty(){return false;}}; }, createEmpty(){ return {}; } };
-const remoteStub = { getCurrentWindow(){ return fakeWin; }, Tray, Menu, nativeImage, app:{ quit(){log.quit++;}, relaunch(){}, exit(){}, dock:{show(){}}, async getFileIcon(){ return {isEmpty(){return true;}}; } } };
+// app(main 프로세스) 이벤트 레지스트리 — 단일 인스턴스(재실행) 경로 검증용.
+const appEvents = {};
+const remoteStub = { getCurrentWindow(){ return fakeWin; }, Tray, Menu, nativeImage, app:{
+  quit(){log.quit++;}, relaunch(){}, exit(){}, dock:{show(){}},
+  async getFileIcon(){ return {isEmpty(){return true;}}; },
+  prependListener(ev,fn){ (appEvents[ev]=appEvents[ev]||[]).unshift(fn); },
+  on(ev,fn){ (appEvents[ev]=appEvents[ev]||[]).push(fn); },
+  removeListener(ev,fn){ appEvents[ev]=(appEvents[ev]||[]).filter(f=>f!==fn); },
+  _emit(ev,...args){ (appEvents[ev]||[]).slice().forEach(fn=>fn(...args)); },
+} };
 
 Module._load = function(req, parent, isMain){
   if (req === "obsidian") return obsidianStub;
@@ -66,8 +75,26 @@ const p = new PluginClass(app, { id:"background-tray" });
   // toggle: 지금 숨김상태 → show+focus
   p.toggleWindow();
   ok(log.shown===1 && log.focused===1, "toggleWindow 로 창 복귀");
+  // ── 트레이 툴팁 기본값(작업 1) ──
+  ok(log.tooltip==="TestVault - Background Tray", "트레이 툴팁 = '<vault> - Background Tray'");
+  // ── 단일 인스턴스 재실행 깜빡임 수정(작업 2) ──
+  //   작업표시줄에서 다시 켜면 second-instance → 기존 창 복원 + 보관함 선택창 즉시 숨김/닫기.
+  ok((appEvents["second-instance"]||[]).length===1, "second-instance 리스너 등록");
+  ok((appEvents["browser-window-created"]||[]).length===1, "browser-window-created 리스너 등록");
+  const shownBefore=log.shown, quitBefore=log.quit;
+  remoteStub.app._emit("second-instance");
+  ok(log.shown>shownBefore, "재실행 시 기존 창 복원(show)");
+  const picker={ id:2, _visible:true, hidden:0, closed:0,
+    hide(){ this._visible=false; this.hidden++; }, close(){ this.closed++; },
+    isDestroyed(){ return this.closed>0; }, isVisible(){ return this._visible; } };
+  remoteStub.app._emit("browser-window-created", {preventDefault(){}}, picker);
+  ok(picker.hidden>=1 && picker._visible===false, "보관함 선택창: 그려지기 전 즉시 숨김(깜빡임 방지)");
+  await new Promise(r=>setTimeout(r,10));
+  ok(picker.closed===1, "보관함 선택창: 다음 틱에 close");
+  ok(log.quit===quitBefore, "기존 창은 닫지 않음");
   // onunload: 완전 정리(누수 0)
   p.onunload();
+  ok((appEvents["second-instance"]||[]).length===0 && (appEvents["browser-window-created"]||[]).length===0, "onunload: single-instance 리스너 제거(누수 0)");
   ok((log.listeners["close"]||[]).length===0, "onunload: close 리스너 제거(누수 0)");
   ok(log.trayDestroyed===1, "onunload: 트레이 destroy");
   // quitCompletely: reallyQuitting 우회 후 close

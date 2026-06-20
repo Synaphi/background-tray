@@ -91,7 +91,7 @@ const DEFAULT_SETTINGS: BackgroundTraySettings = {
 	createTrayIcon: true,
 	focusOnRelaunch: true,
 	trayIconPath: "",
-	trayTooltip: "{{vault}} | Obsidian",
+	trayTooltip: "{{vault}} - Background Tray",
 };
 
 // 렌더러에서 Electron main 프로세스 모듈을 가져온다. 빌드별 경로 차이 → fallback.
@@ -301,18 +301,30 @@ export default class BackgroundTrayPlugin extends Plugin {
 				/* id 접근 불가 */
 			}
 			if (id === myId) return; // 우리 창은 건드리지 않음
-			// second-instance 직후(짧은 창)에 생긴 새 창 = 보관함 선택창 → 닫는다.
+			// second-instance 직후(짧은 창)에 생긴 새 창 = 보관함 선택창.
 			if (
 				this.lastRelaunchAt > 0 &&
 				Date.now() - this.lastRelaunchAt < 4000
 			) {
+				// ★ 깜빡임 수정: 예전엔 120ms 뒤에 close() 했는데, 그 사이 보관함
+				//   선택창이 잠깐 화면에 그려졌다 닫혀 "한 번 깜빡"하는 현상이 있었다
+				//   (특히 트레이 숨김 중 작업표시줄에서 재실행할 때). 이제는 생성 즉시
+				//   숨겨 화면에 그려지기 전에 차단하고, 다음 틱에 곧바로 닫는다.
+				try {
+					w.hide();
+				} catch {
+					/* 숨김 실패 무시 */
+				}
 				window.setTimeout(() => {
 					try {
-						if (!w.isDestroyed()) w.close();
+						if (!w.isDestroyed()) {
+							w.hide();
+							w.close();
+						}
 					} catch {
 						/* 이미 닫힘 */
 					}
-				}, 120);
+				}, 0);
 			}
 		};
 		try {
@@ -423,10 +435,9 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 	private renderTooltip(): string {
 		const vault = this.app.vault.getName();
-		return (this.settings.trayTooltip || "{{vault}} | Obsidian").replace(
-			/\{\{vault\}\}/g,
-			vault
-		);
+		return (
+			this.settings.trayTooltip || "{{vault}} - Background Tray"
+		).replace(/\{\{vault\}\}/g, vault);
 	}
 
 	// ── 창 동작 ──────────────────────────────────────────────────────
