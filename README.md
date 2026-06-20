@@ -21,7 +21,7 @@ A robust, modern reimplementation of the (now unmaintained) `obsidian-tray`, bui
 - **Run in background** — closing the window (X) hides Obsidian to the tray instead of quitting.
 - **Tray icon** — left-click toggles show/hide; right-click menu: Show/Hide, Relaunch, Quit completely. Uses Obsidian's own app icon by default.
 - **Single-instance focus** — relaunching Obsidian while it's hidden in the tray restores the existing window instead of opening the vault switcher. (Toggle in settings.)
-- **Quit completely / Relaunch** — from the tray menu or the command palette.
+- **Quit completely / Relaunch** — from the tray icon's right-click menu.
 - **Custom tray icon & tooltip** — `{{vault}}` is replaced with the vault name.
 - Turning the plugin off restores all default behaviour completely (no leftover listeners).
 
@@ -37,7 +37,12 @@ Settings → Community plugins.
 
 ## Usage
 
-Close the window and Obsidian keeps running in the tray — and so does your sync. Click the tray icon to bring it back. To actually quit, use the tray menu's **Quit completely** or the command palette.
+Close the window and Obsidian keeps running in the tray — and so does your sync. Click the tray icon to bring it back. To actually quit, right-click the tray icon and choose **Quit completely**.
+
+## What's new in 1.0.6
+
+- **Fix:** relaunching Obsidian from the taskbar while it was hidden in the tray could quit the running instance. The vault switcher is now suppressed safely without ever tearing down the existing window.
+- Removed the command-palette entries to keep the plugin strictly single-purpose (everything is on the tray icon's right-click menu).
 
 ## What's new in 1.0.5
 

@@ -34,6 +34,7 @@ interface ElectronWindow {
 	isDestroyed(): boolean;
 	setSkipTaskbar(skip: boolean): void;
 	on(event: "close", listener: (e: ElectronEvent) => void): void;
+	on(event: "ready-to-show" | "show", listener: () => void): void;
 	removeListener(event: "close", listener: ElectronListener): void;
 }
 
@@ -164,23 +165,8 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 		if (this.settings.createTrayIcon) await this.createTray();
 
-		// 커맨드 팔레트 (사용자가 단축키 매니저로 바인딩 가능)
-		this.addCommand({
-			id: "toggle-window",
-			name: "Toggle window (show/hide)",
-			callback: () => this.toggleWindow(),
-		});
-		this.addCommand({
-			id: "quit-completely",
-			name: "Quit completely",
-			callback: () => this.quitCompletely(),
-		});
-		this.addCommand({
-			id: "relaunch-obsidian",
-			name: "Relaunch Obsidian",
-			callback: () => this.relaunch(),
-		});
-
+		// 단일 목적 유지: 커맨드 팔레트/단축키는 등록하지 않는다.
+		// (모든 동작은 트레이 아이콘과 우클릭 메뉴로 제공 — Show/Hide·Relaunch·Quit.)
 		this.addSettingTab(new BackgroundTraySettingTab(this.app, this));
 	}
 
@@ -300,31 +286,47 @@ export default class BackgroundTrayPlugin extends Plugin {
 			} catch {
 				/* id 접근 불가 */
 			}
-			if (id === myId) return; // 우리 창은 건드리지 않음
+			if (id === myId) return; // 우리 창은 절대 건드리지 않음
 			// second-instance 직후(짧은 창)에 생긴 새 창 = 보관함 선택창.
 			if (
 				this.lastRelaunchAt > 0 &&
 				Date.now() - this.lastRelaunchAt < 4000
 			) {
-				// ★ 깜빡임 수정: 예전엔 120ms 뒤에 close() 했는데, 그 사이 보관함
-				//   선택창이 잠깐 화면에 그려졌다 닫혀 "한 번 깜빡"하는 현상이 있었다
-				//   (특히 트레이 숨김 중 작업표시줄에서 재실행할 때). 이제는 생성 즉시
-				//   숨겨 화면에 그려지기 전에 차단하고, 다음 틱에 곧바로 닫는다.
+				// ★ 깜빡임 수정 (안전판):
+				//   - 선택창이 "보이려 할 때마다"(ready-to-show/show) 즉시 숨겨 화면 깜빡임을 막는다.
+				//   - 닫기는 Obsidian이 창 초기화를 끝낼 시간을 준 뒤 수행한다. (너무 일찍 close 하면
+				//     Obsidian이 통째로 종료돼 버리는 회귀가 있었음 — 1.0.5. 충분한 지연 유지.)
+				//   - 닫기 직전에 기존 창을 다시 띄워 "열린 창 0개 → 자동 종료"를 원천 차단한다.
+				const hidePicker = () => {
+					try {
+						if (!w.isDestroyed()) w.hide();
+					} catch {
+						/* 숨김 실패 무시 */
+					}
+				};
 				try {
-					w.hide();
+					w.on("ready-to-show", hidePicker);
 				} catch {
-					/* 숨김 실패 무시 */
+					/* 이벤트 미지원 */
 				}
+				try {
+					w.on("show", hidePicker);
+				} catch {
+					/* 이벤트 미지원 */
+				}
+				window.setTimeout(hidePicker, 0);
 				window.setTimeout(() => {
 					try {
-						if (!w.isDestroyed()) {
-							w.hide();
-							w.close();
-						}
+						// 안전판: 그새 플러그인이 언로드됐거나 기존 창이 사라졌으면
+						// 선택창을 닫지 않는다. (기존 창이 살아있을 때만 닫아 "창 0개 → 자동 종료"를 차단.)
+						const win = this.win;
+						if (!this.remote || !win || win.isDestroyed()) return;
+						this.showWindow(); // 기존 창을 먼저 보장
+						if (!w.isDestroyed()) w.close();
 					} catch {
 						/* 이미 닫힘 */
 					}
-				}, 0);
+				}, 150);
 			}
 		};
 		try {

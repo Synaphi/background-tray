@@ -66,7 +66,7 @@ const p = new PluginClass(app, { id:"background-tray" });
   await p.onload();
   ok(log.trayCreated===1, "트레이 1개 생성");
   ok((log.listeners["close"]||[]).length===1, "close 리스너 1개 등록");
-  ok(p._commands.length===3, "커맨드 3개 등록(toggle/quit/relaunch)");
+  ok(p._commands.length===0, "커맨드 미등록(단일목적·단축키 버튼 제거)");
   // 닫기 시뮬레이션: runInBackground 기본 ON → preventDefault + hide
   let prevented=false; const ev={preventDefault(){prevented=true;}};
   (log.listeners["close"]||[]).forEach(fn=>fn(ev));
@@ -84,14 +84,19 @@ const p = new PluginClass(app, { id:"background-tray" });
   const shownBefore=log.shown, quitBefore=log.quit;
   remoteStub.app._emit("second-instance");
   ok(log.shown>shownBefore, "재실행 시 기존 창 복원(show)");
-  const picker={ id:2, _visible:true, hidden:0, closed:0,
+  // Obsidian이 직후 만드는 보관함 선택창(새 창, id=2) — show/ready-to-show 이벤트 지원.
+  const picker={ id:2, _visible:true, hidden:0, closed:0, _ev:{},
+    on(ev,fn){ (this._ev[ev]=this._ev[ev]||[]).push(fn); },
+    fire(ev){ (this._ev[ev]||[]).forEach(f=>f()); },
     hide(){ this._visible=false; this.hidden++; }, close(){ this.closed++; },
     isDestroyed(){ return this.closed>0; }, isVisible(){ return this._visible; } };
   remoteStub.app._emit("browser-window-created", {preventDefault(){}}, picker);
-  ok(picker.hidden>=1 && picker._visible===false, "보관함 선택창: 그려지기 전 즉시 숨김(깜빡임 방지)");
-  await new Promise(r=>setTimeout(r,10));
-  ok(picker.closed===1, "보관함 선택창: 다음 틱에 close");
-  ok(log.quit===quitBefore, "기존 창은 닫지 않음");
+  picker.fire("ready-to-show");
+  picker.fire("show");
+  ok(picker.hidden>=1 && picker._visible===false, "보관함 선택창: 보이려 할 때 즉시 숨김(깜빡임 방지)");
+  await new Promise(r=>setTimeout(r,220));
+  ok(picker.closed===1, "보관함 선택창: 안전 지연 뒤 close");
+  ok(log.quit===quitBefore, "★회귀 방지: 기존 Obsidian 종료/창 닫힘 없음(quit 미호출)");
   // onunload: 완전 정리(누수 0)
   p.onunload();
   ok((appEvents["second-instance"]||[]).length===0 && (appEvents["browser-window-created"]||[]).length===0, "onunload: single-instance 리스너 제거(누수 0)");
