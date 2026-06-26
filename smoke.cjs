@@ -78,24 +78,26 @@ const p = new PluginClass(app, { id:"background-tray" });
   // ── 트레이 툴팁 기본값(작업 1) ──
   ok(log.tooltip==="TestVault - Background Tray", "트레이 툴팁 = '<vault> - Background Tray'");
   // ── 단일 인스턴스 재실행 깜빡임 수정(작업 2) ──
-  //   작업표시줄에서 다시 켜면 second-instance → 기존 창 복원 + 보관함 선택창 즉시 숨김/닫기.
+  //   작업표시줄에서 다시 켜면 second-instance → 기존 창 복원 + 보관함 선택창 즉시 숨김.
   ok((appEvents["second-instance"]||[]).length===1, "second-instance 리스너 등록");
   ok((appEvents["browser-window-created"]||[]).length===1, "browser-window-created 리스너 등록");
   const shownBefore=log.shown, quitBefore=log.quit;
   remoteStub.app._emit("second-instance");
   ok(log.shown>shownBefore, "재실행 시 기존 창 복원(show)");
   // Obsidian이 직후 만드는 보관함 선택창(새 창, id=2) — show/ready-to-show 이벤트 지원.
-  const picker={ id:2, _visible:true, hidden:0, closed:0, _ev:{},
+  const picker={ id:2, _visible:true, hidden:0, closed:0, skipTaskbar:false, _ev:{},
     on(ev,fn){ (this._ev[ev]=this._ev[ev]||[]).push(fn); },
     fire(ev){ (this._ev[ev]||[]).forEach(f=>f()); },
     hide(){ this._visible=false; this.hidden++; }, close(){ this.closed++; },
+    setSkipTaskbar(v){ this.skipTaskbar=v; },
     isDestroyed(){ return this.closed>0; }, isVisible(){ return this._visible; } };
   remoteStub.app._emit("browser-window-created", {preventDefault(){}}, picker);
   picker.fire("ready-to-show");
   picker.fire("show");
   ok(picker.hidden>=1 && picker._visible===false, "보관함 선택창: 보이려 할 때 즉시 숨김(깜빡임 방지)");
   await new Promise(r=>setTimeout(r,220));
-  ok(picker.closed===1, "보관함 선택창: 안전 지연 뒤 close");
+  ok(picker.closed===0, "보관함 선택창: close 하지 않음(window-all-closed 회귀 방지)");
+  ok(picker.skipTaskbar===true, "보관함 선택창: 작업표시줄 제외");
   ok(log.quit===quitBefore, "★회귀 방지: 기존 Obsidian 종료/창 닫힘 없음(quit 미호출)");
   // onunload: 완전 정리(누수 0)
   p.onunload();

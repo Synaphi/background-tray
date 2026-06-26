@@ -1,7 +1,7 @@
 {
 	"id": "background-tray",
 	"name": "Background Tray",
-	"version": "1.0.6",
+	"version": "1.0.7",
 	"minAppVersion": "1.4.0",
 	"description": "Keep running in the system tray instead of quitting when you close the window.",
 	"author": "Synaphi",

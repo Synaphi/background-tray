@@ -292,16 +292,21 @@ export default class BackgroundTrayPlugin extends Plugin {
 				this.lastRelaunchAt > 0 &&
 				Date.now() - this.lastRelaunchAt < 4000
 			) {
-				// ★ 깜빡임 수정 (안전판):
+				// ★ 깜빡임/종료 회귀 방지:
 				//   - 선택창이 "보이려 할 때마다"(ready-to-show/show) 즉시 숨겨 화면 깜빡임을 막는다.
-				//   - 닫기는 Obsidian이 창 초기화를 끝낼 시간을 준 뒤 수행한다. (너무 일찍 close 하면
-				//     Obsidian이 통째로 종료돼 버리는 회귀가 있었음 — 1.0.5. 충분한 지연 유지.)
-				//   - 닫기 직전에 기존 창을 다시 띄워 "열린 창 0개 → 자동 종료"를 원천 차단한다.
+				//   - 새 선택창은 닫지 않는다. Obsidian 1.12/Electron 39에서는 hidden main window가
+				//     있어도 picker close 가 window-all-closed 종료 흐름을 밟을 수 있다.
+				//   - 대신 작업표시줄에서도 제외하고 기존 창만 전면으로 복원한다.
 				const hidePicker = () => {
 					try {
 						if (!w.isDestroyed()) w.hide();
 					} catch {
 						/* 숨김 실패 무시 */
+					}
+					try {
+						if (!w.isDestroyed()) w.setSkipTaskbar(true);
+					} catch {
+						/* 일부 플랫폼/창에서는 미지원 */
 					}
 				};
 				try {
@@ -317,14 +322,12 @@ export default class BackgroundTrayPlugin extends Plugin {
 				window.setTimeout(hidePicker, 0);
 				window.setTimeout(() => {
 					try {
-						// 안전판: 그새 플러그인이 언로드됐거나 기존 창이 사라졌으면
-						// 선택창을 닫지 않는다. (기존 창이 살아있을 때만 닫아 "창 0개 → 자동 종료"를 차단.)
 						const win = this.win;
 						if (!this.remote || !win || win.isDestroyed()) return;
-						this.showWindow(); // 기존 창을 먼저 보장
-						if (!w.isDestroyed()) w.close();
+						hidePicker();
+						this.showWindow();
 					} catch {
-						/* 이미 닫힘 */
+						/* 창 복원 실패 무시 */
 					}
 				}, 150);
 			}
