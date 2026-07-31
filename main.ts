@@ -165,8 +165,22 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 		if (this.settings.createTrayIcon) await this.createTray();
 
-		// 단일 목적 유지: 커맨드 팔레트/단축키는 등록하지 않는다.
-		// (모든 동작은 트레이 아이콘과 우클릭 메뉴로 제공 — Show/Hide·Relaunch·Quit.)
+		this.addCommand({
+			id: "toggle-window",
+			name: "Show / Hide window",
+			callback: () => this.toggleWindow(),
+		});
+		this.addCommand({
+			id: "show-window",
+			name: "Show window",
+			callback: () => this.showWindow(),
+		});
+		this.addCommand({
+			id: "hide-window",
+			name: "Hide window",
+			callback: () => this.hideWindow(),
+		});
+
 		this.addSettingTab(new BackgroundTraySettingTab(this.app, this));
 	}
 
@@ -469,6 +483,16 @@ export default class BackgroundTrayPlugin extends Plugin {
 			win.focus();
 		} catch {
 			/* 창 복귀 실패 무시 */
+		}
+	}
+
+	hideWindow() {
+		const win = this.win;
+		if (!win) return;
+		try {
+			win.hide();
+		} catch {
+			/* 창 숨김 실패 무시 */
 		}
 	}
 
