@@ -40,6 +40,10 @@ Settings → Community plugins.
 
 Close the window and Obsidian keeps running in the tray — and so does your sync. Click the tray icon to bring it back. To actually quit, right-click the tray icon and choose **Quit completely**.
 
+## What's new in 1.0.9
+
+- The settings screen is now in English. The option descriptions, notices and error messages had been Korean since 1.0.1 — only the option names were translated.
+
 ## What's new in 1.0.8
 
 - **Fix:** with several vaults open, every tray icon showed the same tooltip. Each icon now shows its own vault name.

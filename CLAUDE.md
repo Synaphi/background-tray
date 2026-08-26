@@ -1,44 +1,62 @@
 # CLAUDE.md — Background Tray (code repo)
 
-이 폴더는 **코드 리포**입니다. **정본(설계·명세·로드맵·작업 규칙)은 Obsidian 문서**에 있습니다.
-코드를 만지기 전에 아래 정본을 먼저 읽으세요.
+This folder is the **code repo**. The **source of truth for design, spec, roadmap and working
+rules lives in the Obsidian vault** (written in Korean). Read it before touching the code.
 
-## 정본 위치 (Obsidian — single source of truth)
+## Source of truth (Obsidian vault)
 
-| 문서 | 역할 |
+| Document | Role |
 |---|---|
-| `C:\Obsidian\05. Projects\BackgroundTray\00. OVERVIEW.md` | 허브 — 상태·로드맵·열린 결정·링크 |
-| `…\01. Spec.md` | 기술 명세 — ★Electron 연동·onunload 정리 체크리스트·기능 풀세트 |
-| `…\02. Build_and_Deploy.md` | 빌드·테스트·GitHub·커뮤니티 스토어 배포 |
-| `…\03. Scaffold.md` | 빌드 검증된 파일들의 정본(붙여넣기용) |
-| `…\90. Worklog.md` / `…\91. Feedback_Backlog.md` | 자가발전 루프 (작업 기록·백로그) |
-| `C:\Obsidian\_AI_GUIDE.md` / `C:\Obsidian\_PROJECT_LOOP.md` | 볼트 공통 규칙 |
+| `C:\Obsidian\05. Projects\BackgroundTray\00. OVERVIEW.md` | Hub — status, roadmap, open decisions, links |
+| `…\01. Spec.md` | Technical spec — ★Electron integration, onunload cleanup checklist |
+| `…\02. Build_and_Deploy.md` | Build, test, GitHub, community-store release |
+| `…\03. Scaffold.md` | Verified scaffold files |
+| `…\90. Worklog.md` / `…\91. Feedback_Backlog.md` | Worklog and backlog (self-improvement loop) |
+| `C:\Obsidian\_AI_GUIDE.md` / `C:\Obsidian\_PROJECT_LOOP.md` | Vault-wide rules |
 
-> 코드와 문서가 어긋나면 **Obsidian 문서가 우선**입니다. 이 리포의 변경은 관련 Obsidian 문서에 반영하세요.
+> When code and docs disagree, **the Obsidian docs win**. Reflect repo changes back into them.
 
-## 이 리포 사실
+## Repo facts
 
-- **코드 위치**: `C:\Projects\BackgroundTray` (로컬) → GitHub `synaphi/background-tray`(예정).
-- **개발 PC**: **7950X 전용**. `.obsidian/plugins` 동기화 충돌 방지를 위해 이 플러그인의 개발·테스트는 7950X에서만 합니다.
-- **테스트 배포 위치**: `C:\Obsidian\.obsidian\plugins\background-tray\` (`main.js`+`manifest.json`+`styles.css`).
-- **현재 범위**: MVP(로드맵 1단계 — Run in background + 트레이). 2~6단계는 미구현.
+- **Source of truth for code**: GitHub `Synaphi/background-tray` (public). Clone it anywhere,
+  work, push — local folders are throwaway working copies, not the canonical location.
+- **Releases are automated**: pushing a tag that matches `manifest.json` version runs
+  `.github/workflows/release.yml`, which builds and attaches `main.js` / `manifest.json` /
+  `styles.css` plus build provenance as a draft release. Publish the draft afterwards.
+- **Local test deploy**: `C:\Obsidian\.obsidian\plugins\background-tray\`
+  (`main.js` + `manifest.json` + `styles.css`).
+- ⚠️ **Real-device verification happens on one PC at a time.** `.obsidian/plugins` is covered by
+  Obsidian Sync, so deploying from two machines at once makes `main.js` overwrite itself.
+  CI cannot verify tray/Electron behaviour — the smoke test missed the 1.0.5 and 1.0.6 quit
+  regressions, so always verify in a real Obsidian before tagging.
+- **Scope**: one job only — run in background + tray icon. Extra features were deliberately
+  dropped to keep the plugin small.
 
-## 빌드 / 테스트
+## Build / test
 
 ```bash
 npm install
 npm run dev      # esbuild watch → main.js
-npm run build    # tsc 타입체크 + esbuild production (배포/검증용, exit 0 확인)
-node smoke.cjs   # Electron 없이 핵심 경로 회귀 스모크 (10/10 PASS 기대)
+npm run build    # tsc typecheck + esbuild production (expect exit 0)
+node smoke.cjs   # regression smoke over the core paths, no Electron needed (expect ALL PASS)
 ```
 
-빌드 함정·검증 결과는 `03. Scaffold.md` §검증요약 참조. 핵심:
-- esbuild `external`에 `electron`·`@electron/remote` 필수(누락 시 번들 깨짐).
-- `strict: true` → `settings` 필드는 `settings!:` (definite assignment).
+Build gotchas:
 
-## 작업 규칙 (요약 — 상세는 _AI_GUIDE / _PROJECT_LOOP)
+- esbuild `external` must include `electron` and `@electron/remote` (the bundle breaks otherwise).
+- With `strict: true`, the `settings` field needs `settings!:` (definite assignment).
 
-1. 시작 시 `91. Feedback_Backlog`의 open 항목부터 확인.
-2. 기능 단위로 incremental. 각 단계 후 빌드가 깨지지 않는지 확인하고 **"계속 진행할까요?"**를 묻는다. 혼자 끝까지 달리지 말 것.
-3. 모든 Electron 호출은 try/catch — 앱 크래시 절대 금지. `onunload`는 Spec §3.4 체크리스트를 전부 수행(끄면 100% 원복).
-4. 종료 시 `90. Worklog`에 한 줄 + 관련 문서 `status`/`updated` 갱신. 중요 변경은 `_AI_GUIDE` 접속 로그(2시간 간격·UTF-8·프론트매터·서명).
+## Conventions
+
+- **Write code, comments and user-facing strings in English.** The repo is public and takes
+  outside contributions; only the Obsidian vault documents are in Korean.
+- Wrap every Electron call in try/catch — never crash the app.
+- `onunload` must run the full cleanup checklist (01. Spec §3.4) so disabling the plugin
+  restores stock behaviour completely.
+
+## Working rules (summary — details in _AI_GUIDE / _PROJECT_LOOP)
+
+1. Start by reviewing the open items in `91. Feedback_Backlog`.
+2. Work incrementally. After each step check the build still passes and **ask before continuing** —
+   do not run to the end alone.
+3. On finishing, add one line to `90. Worklog` and refresh `status` / `updated` in the related docs.

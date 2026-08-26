@@ -1,4 +1,4 @@
-// 번들된 main.js를 stub 환경에서 로드해 핵심 경로를 검증한다 (Electron 런타임 없이).
+// Load the bundled main.js in a stub environment and exercise the core paths (no Electron runtime).
 const Module = require("module");
 const origLoad = Module._load;
 
@@ -30,7 +30,7 @@ const fakeWin = {
 class Tray { constructor(i){ this.icon=i; log.trayCreated++; } setToolTip(t){ log.tooltip=t; } setContextMenu(){} on(){} destroy(){ log.trayDestroyed++; } }
 const Menu = { buildFromTemplate(t){ log.menuTemplate=t; return {_t:t}; } };
 const nativeImage = { createFromPath(){ return {isEmpty(){return true;}}; }, createFromDataURL(){ return {isEmpty(){return false;}}; }, createEmpty(){ return {}; } };
-// app(main 프로세스) 이벤트 레지스트리 — 단일 인스턴스(재실행) 경로 검증용.
+// Registry of app (main-process) events — used to exercise the single-instance relaunch path.
 const appEvents = {};
 const remoteStub = { getCurrentWindow(){ return fakeWin; }, Tray, Menu, nativeImage, app:{
   quit(){log.quit++;}, relaunch(){}, exit(){}, dock:{show(){}},
@@ -48,7 +48,7 @@ Module._load = function(req, parent, isMain){
   return origLoad.apply(this, arguments);
 };
 
-// ── window 전역 stub ── 렌더러의 window.require / beforeunload / setTimeout 흉내.
+// ── global window stub ── mimics the renderer window.require / beforeunload / setTimeout.
 const _winListeners = {};
 global.window = {
   require,
@@ -67,30 +67,30 @@ const p = new PluginClass(app, { id:"background-tray" });
 (async () => {
   let fail=0; const ok=(c,m)=>{ console.log((c?"  PASS":"  FAIL")+" — "+m); if(!c)fail++; };
   await p.onload();
-  ok(log.trayCreated===1, "트레이 1개 생성");
-  ok((log.listeners["close"]||[]).length===1, "close 리스너 1개 등록");
-  ok(p._commands.length===3, "커맨드 3개 등록(show/hide/toggle)");
-  ok(p._commands.map(c=>c.id).sort().join(",")==="hide-window,show-window,toggle-window", "커맨드 id = show/hide/toggle-window");
-  // 닫기 시뮬레이션: runInBackground 기본 ON → preventDefault + hide
+  ok(log.trayCreated===1, "creates exactly one tray");
+  ok((log.listeners["close"]||[]).length===1, "registers exactly one close listener");
+  ok(p._commands.length===3, "registers 3 commands (show/hide/toggle)");
+  ok(p._commands.map(c=>c.id).sort().join(",")==="hide-window,show-window,toggle-window", "command ids = show/hide/toggle-window");
+  // Simulate closing: runInBackground defaults to ON → preventDefault + hide
   let prevented=false; const ev={preventDefault(){prevented=true;}};
   (log.listeners["close"]||[]).forEach(fn=>fn(ev));
-  ok(prevented===true, "닫기 가로채기: preventDefault 호출");
-  ok(log.hidden===1, "닫기 시 창 hide");
-  // toggle: 지금 숨김상태 → show+focus
+  ok(prevented===true, "close interception: calls preventDefault");
+  ok(log.hidden===1, "hides the window on close");
+  // toggle: currently hidden → show+focus
   p.toggleWindow();
-  ok(log.shown===1 && log.focused===1, "toggleWindow 로 창 복귀");
-  // ── 트레이 툴팁 기본값(작업 1) ──
-  ok(log.tooltip==="TestVault — Obsidian", "트레이 툴팁 = '<vault> — Obsidian'");
-  ok(log.menuTemplate[0].label==="TestVault" && log.menuTemplate[0].enabled===false, "우클릭 메뉴 첫 항목 = 볼트명(비활성 헤더)");
-  ok(log.menuTemplate.some(i=>i.label==="Show / Hide") && log.menuTemplate.some(i=>i.label==="Quit completely"), "메뉴 헤더 추가 후에도 기존 항목 유지");
-  // ── 단일 인스턴스 재실행 깜빡임 수정(작업 2) ──
-  //   작업표시줄에서 다시 켜면 second-instance → 기존 창 복원 + 보관함 선택창 즉시 숨김.
-  ok((appEvents["second-instance"]||[]).length===1, "second-instance 리스너 등록");
-  ok((appEvents["browser-window-created"]||[]).length===1, "browser-window-created 리스너 등록");
+  ok(log.shown===1 && log.focused===1, "toggleWindow brings the window back");
+  // ── default tray tooltip ──
+  ok(log.tooltip==="TestVault — Obsidian", "tray tooltip = '<vault> — Obsidian'");
+  ok(log.menuTemplate[0].label==="TestVault" && log.menuTemplate[0].enabled===false, "first menu item = vault name (disabled header)");
+  ok(log.menuTemplate.some(i=>i.label==="Show / Hide") && log.menuTemplate.some(i=>i.label==="Quit completely"), "existing menu items survive the added header");
+  // ── single-instance relaunch, without the flicker ──
+  //   Relaunching from the taskbar fires second-instance → restore the existing window and hide the vault picker at once.
+  ok((appEvents["second-instance"]||[]).length===1, "registers the second-instance listener");
+  ok((appEvents["browser-window-created"]||[]).length===1, "registers the browser-window-created listener");
   const shownBefore=log.shown, quitBefore=log.quit;
   remoteStub.app._emit("second-instance");
-  ok(log.shown>shownBefore, "재실행 시 기존 창 복원(show)");
-  // Obsidian이 직후 만드는 보관함 선택창(새 창, id=2) — show/ready-to-show 이벤트 지원.
+  ok(log.shown>shownBefore, "relaunch restores the existing window (show)");
+  // The vault picker Obsidian opens right after (a new window, id=2) — supports show/ready-to-show.
   const picker={ id:2, _visible:true, hidden:0, closed:0, skipTaskbar:false, _ev:{},
     on(ev,fn){ (this._ev[ev]=this._ev[ev]||[]).push(fn); },
     fire(ev){ (this._ev[ev]||[]).forEach(f=>f()); },
@@ -100,35 +100,35 @@ const p = new PluginClass(app, { id:"background-tray" });
   remoteStub.app._emit("browser-window-created", {preventDefault(){}}, picker);
   picker.fire("ready-to-show");
   picker.fire("show");
-  ok(picker.hidden>=1 && picker._visible===false, "보관함 선택창: 보이려 할 때 즉시 숨김(깜빡임 방지)");
+  ok(picker.hidden>=1 && picker._visible===false, "vault picker: hidden the moment it tries to appear (no flicker)");
   await new Promise(r=>setTimeout(r,220));
-  ok(picker.closed===0, "보관함 선택창: close 하지 않음(window-all-closed 회귀 방지)");
-  ok(picker.skipTaskbar===true, "보관함 선택창: 작업표시줄 제외");
-  ok(log.quit===quitBefore, "★회귀 방지: 기존 Obsidian 종료/창 닫힘 없음(quit 미호출)");
-  // onunload: 완전 정리(누수 0)
+  ok(picker.closed===0, "vault picker: never closed (guards the window-all-closed regression)");
+  ok(picker.skipTaskbar===true, "vault picker: dropped from the taskbar");
+  ok(log.quit===quitBefore, "★regression guard: the running Obsidian is never quit or closed");
+  // onunload: full cleanup (zero leaks)
   p.onunload();
-  ok((appEvents["second-instance"]||[]).length===0 && (appEvents["browser-window-created"]||[]).length===0, "onunload: single-instance 리스너 제거(누수 0)");
-  ok((log.listeners["close"]||[]).length===0, "onunload: close 리스너 제거(누수 0)");
-  ok(log.trayDestroyed===1, "onunload: 트레이 destroy");
-  // ── 볼트명 폴백 체인(1.0.8 버그 수정: 모든 볼트에서 툴팁이 같아 보이던 문제) ──
+  ok((appEvents["second-instance"]||[]).length===0 && (appEvents["browser-window-created"]||[]).length===0, "onunload: single-instance listeners removed (zero leaks)");
+  ok((log.listeners["close"]||[]).length===0, "onunload: close listener removed (zero leaks)");
+  ok(log.trayDestroyed===1, "onunload: tray destroyed");
+  // ── vault-name fallback chain (1.0.8 fix: every vault showed the same tooltip) ──
   const pFallback = new PluginClass(mkApp({ getName(){ return "   "; }, adapter:{ getBasePath(){ return "D:\\Vaults\\PathVault\\"; } } }), {id:"background-tray"});
   await pFallback.onload();
-  ok(log.tooltip==="PathVault — Obsidian", "getName() 빈값 → 보관함 경로에서 볼트명 복구");
-  ok(log.menuTemplate[0].label==="PathVault", "폴백 볼트명이 메뉴 헤더에도 반영");
+  ok(log.tooltip==="PathVault — Obsidian", "getName() empty → vault name recovered from the vault path");
+  ok(log.menuTemplate[0].label==="PathVault", "fallback vault name also reaches the menu header");
   pFallback.onunload();
 
   const pTitle = new PluginClass(mkApp({ getName(){ return ""; }, adapter:{} }), {id:"background-tray"});
   await pTitle.onload();
-  ok(log.tooltip==="TitleVault — Obsidian", "getName()·경로 모두 실패 → 창 제목에서 볼트명 복구");
+  ok(log.tooltip==="TitleVault — Obsidian", "getName() and path both fail → vault name recovered from the window title");
   pTitle.onunload();
 
-  // quitCompletely: reallyQuitting 우회 후 close
+  // quitCompletely: bypasses the interception via reallyQuitting, then closes
   const p2 = new PluginClass(app, {id:"background-tray"}); await p2.onload();
   p2.quitCompletely();
-  ok(log.quit>=1, "quitCompletely: 실제 종료 경로 호출");
-  // 닫기 가로채기 우회 검증: reallyQuitting 상태에서 close 이벤트 → preventDefault 안 함
+  ok(log.quit>=1, "quitCompletely: takes the real quit path");
+  // Bypass check: while reallyQuitting, a close event must not be preventDefault-ed
   let prevented2=false; (log.listeners["close"]||[]).forEach(fn=>fn({preventDefault(){prevented2=true;}}));
-  ok(prevented2===false, "reallyQuitting 시 닫기 가로채기 우회");
+  ok(prevented2===false, "close interception is bypassed while reallyQuitting");
   p2.onunload();
   console.log(fail===0 ? "\nALL PASS" : `\n${fail} FAIL`);
   process.exit(fail===0?0:1);

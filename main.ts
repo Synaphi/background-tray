@@ -1,16 +1,16 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
 
 /*
- * Background Tray — MVP (로드맵 1단계: Run in background + 트레이 아이콘)
- * 전역 단축키·빠른 노트·자동 실행 등은 후속 단계. 01. Spec / 00. OVERVIEW 참조.
+ * Background Tray — keep Obsidian running in the system tray instead of quitting.
+ * Single purpose by design. Design notes live in the project docs (00. OVERVIEW / 01. Spec).
  */
 
-// 마지막 수단 fallback 아이콘 (16x16 PNG). 평소엔 app.getFileIcon 으로 실제 Obsidian 아이콘 사용.
+// Last-resort fallback icon (16x16 PNG). Normally app.getFileIcon gives us the real Obsidian icon.
 const DEFAULT_TRAY_ICON =
 	"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAGUlEQVR42mOosXr7nxLMMGrAqAGjBgwXAwBGOKIfCm+pOwAAAABJRU5ErkJggg==";
 
-// ── Electron(렌더러에서 접근하는 main 프로세스 API) 최소 타입 ──────────
-// any 대신 실제로 사용하는 멤버만 좁게 선언해 unsafe-access 계열 경고를 없앤다.
+// ── Minimal types for the Electron main-process API reached from the renderer ──
+// Declaring only the members we actually use keeps the unsafe-access lint rules quiet.
 interface ElectronEvent {
 	preventDefault(): void;
 	returnValue?: boolean;
@@ -96,8 +96,8 @@ const DEFAULT_SETTINGS: BackgroundTraySettings = {
 	trayTooltip: "{{vault}} — Obsidian",
 };
 
-// 렌더러에서 Electron main 프로세스 모듈을 가져온다. 빌드별 경로 차이 → fallback.
-// require() 리터럴 대신 window.require 를 통해 가져와 정적 import 규칙을 피한다.
+// Reach the Electron main-process module from the renderer. The path differs between builds,
+// so fall back; going through window.require avoids the static-import lint rules.
 function getRemote(): ElectronRemote | null {
 	if (typeof window === "undefined") return null;
 	const electronRequire = (
@@ -107,7 +107,7 @@ function getRemote(): ElectronRemote | null {
 	try {
 		return electronRequire("@electron/remote") as ElectronRemote;
 	} catch {
-		/* @electron/remote 미가용 → legacy 시도 */
+		/* @electron/remote unavailable → try the legacy path */
 	}
 	try {
 		const legacy = electronRequire("electron") as {
@@ -115,7 +115,7 @@ function getRemote(): ElectronRemote | null {
 		};
 		return legacy.remote ?? null;
 	} catch {
-		/* Electron 접근 불가 */
+		/* Electron is not reachable */
 	}
 	return null;
 }
@@ -141,9 +141,9 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.remote = getRemote();
 		if (!this.remote) {
 			new Notice(
-				"Background Tray: Electron 접근 불가 — 이 빌드에서는 트레이 기능을 사용할 수 없습니다."
+				"Background Tray: cannot reach Electron — the tray is unavailable in this build."
 			);
-			// 앱은 절대 크래시 금지. 설정 탭만 노출하고 기능은 비활성.
+			// Never crash the app: expose the settings tab only, with the features off.
 			this.addSettingTab(new BackgroundTraySettingTab(this.app, this));
 			return;
 		}
@@ -151,23 +151,23 @@ export default class BackgroundTrayPlugin extends Plugin {
 		try {
 			this.win = this.remote.getCurrentWindow();
 		} catch (e) {
-			console.error("Background Tray: getCurrentWindow 실패", e);
+			console.error("Background Tray: getCurrentWindow failed", e);
 			this.win = null;
 		}
 
-		// ★ 닫기 가로채기는 두 층으로 건다:
-		//   (1) beforeunload (렌더러 자체 이벤트) — Electron 39에서 신뢰성 있게 veto 되는 1차 방어.
-		//   (2) window.on("close") (remote) — 일부 환경 fallback. Electron 39 @electron/remote 에서는
-		//       preventDefault 가 무시되는 것을 실측 확인(01. Spec §3.1·§3.3) → beforeunload 가 실질 동작.
+		// ★ Closing is intercepted at two layers:
+		//   (1) beforeunload (a renderer event) — the primary veto, reliable on Electron 39.
+		//   (2) window.on("close") (remote) — a fallback. On Electron 39 with @electron/remote
+		//       preventDefault is ignored (measured; 01. Spec §3.1/§3.3), so beforeunload does the work.
 		this.registerBeforeUnload();
 		this.registerCloseInterception();
-		// 트레이에 숨은 상태에서 재실행 시 기존 창 복원(+ 보관함 선택창 억제).
+		// Restore the existing window when relaunched while hidden (and suppress the vault picker).
 		this.registerSingleInstance();
 
 		if (this.settings.createTrayIcon) await this.createTray();
 
-		// 일부 환경에서 onload 시점의 app.vault.getName() 이 아직 비어 있다 → 레이아웃
-		// 준비 후 볼트명을 한 번 더 확보해 트레이 라벨에 반영한다.
+		// In some environments app.vault.getName() is still empty during onload → resolve the vault
+		// name again once the layout is ready and re-apply the tray labels.
 		this.app.workspace?.onLayoutReady?.(() => this.refreshTrayLabels());
 
 		this.addCommand({
@@ -190,7 +190,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 	}
 
 	onunload() {
-		// 01. Spec §3.4 정리 체크리스트 — 끄면 동작 100% 원복.
+		// Cleanup checklist from 01. Spec §3.4 — turning the plugin off restores everything.
 		this.removeBeforeUnload();
 		this.removeCloseInterception();
 		this.removeSingleInstance();
@@ -198,32 +198,32 @@ export default class BackgroundTrayPlugin extends Plugin {
 		try {
 			this.win?.setSkipTaskbar(false);
 		} catch {
-			/* 창 접근 불가 */
+			/* window unreachable */
 		}
 		try {
-			// (mac) dock 복원
+			// (macOS) restore the dock icon
 			this.remote?.app?.dock?.show?.();
 		} catch {
-			/* dock 없음 */
+			/* no dock */
 		}
 		this.win = null;
 		this.remote = null;
 	}
 
-	// ── 닫기 가로채기 ① beforeunload (1차·실질 동작) ───────────────────
-	// 렌더러 자체 이벤트라 remote 왕복 없이 동기적으로 닫기를 취소할 수 있다.
+	// ── Close interception ① beforeunload (primary path) ─────────────────
+	// A renderer-native event, so the close can be cancelled synchronously with no remote round trip.
 	private registerBeforeUnload() {
 		if (typeof window === "undefined") return;
-		this.removeBeforeUnload(); // 중복 등록 가드
+		this.removeBeforeUnload(); // guard against duplicate registration
 		this.beforeUnloadHandler = (e: BeforeUnloadEvent) => {
 			if (this.settings.runInBackground && !this.reallyQuitting) {
 				e.preventDefault();
-				// Electron: 닫기 취소 (returnValue 는 deprecated 타입 → 캐스트로 우회)
+				// Electron: cancel the close (returnValue is a deprecated type → cast around it)
 				(e as { returnValue: boolean }).returnValue = false;
 				try {
-					this.win?.hide(); // 트레이로 숨김
+					this.win?.hide(); // hide to the tray
 				} catch {
-					/* 숨김 실패 무시 */
+					/* ignore hide failure */
 				}
 			}
 		};
@@ -240,11 +240,11 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.beforeUnloadHandler = null;
 	}
 
-	// ── 닫기 가로채기 ② window.on("close") (fallback) ─────────────────
+	// ── Close interception ② window.on("close") (fallback) ───────────────
 	private registerCloseInterception() {
 		const win = this.win;
 		if (!win) return;
-		this.removeCloseInterception(); // 중복 등록 가드
+		this.removeCloseInterception(); // guard against duplicate registration
 		this.closeHandler = (e: ElectronEvent) => {
 			if (this.settings.runInBackground && !this.reallyQuitting) {
 				e.preventDefault();
@@ -254,7 +254,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 		try {
 			win.on("close", this.closeHandler);
 		} catch (e) {
-			console.error("Background Tray: close 리스너 등록 실패", e);
+			console.error("Background Tray: failed to register the close listener", e);
 			this.closeHandler = null;
 		}
 	}
@@ -264,29 +264,29 @@ export default class BackgroundTrayPlugin extends Plugin {
 			try {
 				this.win.removeListener("close", this.closeHandler);
 			} catch {
-				/* 이미 제거됨 */
+				/* already removed */
 			}
 		}
 		this.closeHandler = null;
 	}
 
-	// ── 단일 인스턴스 포커싱 ───────────────────────────────────────────
-	// 트레이에 숨은 상태에서 Obsidian을 다시 실행하면, Obsidian은 second-instance 에서
-	// 보관함 선택창을 새로 띄운다(실측). → 우리는 기존 창을 복원하고, 직후 생성되는 그
-	// 선택창을 닫아 "기존 창 복귀"처럼 동작하게 한다. (Spec §4.6)
+	// ── Single-instance focus ─────────────────────────────
+	// Relaunching Obsidian while it is hidden in the tray makes Obsidian open a fresh vault
+	// picker from second-instance (measured). We restore the existing window instead and
+	// neutralise that picker, so it behaves like "bring the existing window back". (Spec §4.6)
 	private registerSingleInstance() {
 		const remote = this.remote;
 		const win = this.win;
 		if (!remote || !win) return;
 		const app = remote.app;
 		if (typeof app.prependListener !== "function") return;
-		this.removeSingleInstance(); // 중복 등록 가드
+		this.removeSingleInstance(); // guard against duplicate registration
 
 		let myId = -1;
 		try {
 			myId = win.id;
 		} catch {
-			/* id 접근 불가 */
+			/* id unreachable */
 		}
 
 		this.secondInstanceHandler = () => {
@@ -303,40 +303,40 @@ export default class BackgroundTrayPlugin extends Plugin {
 			try {
 				id = w.id;
 			} catch {
-				/* id 접근 불가 */
+				/* id unreachable */
 			}
-			if (id === myId) return; // 우리 창은 절대 건드리지 않음
-			// second-instance 직후(짧은 창)에 생긴 새 창 = 보관함 선택창.
+			if (id === myId) return; // never touch our own window
+			// A window created right after second-instance (a short window) = the vault picker.
 			if (
 				this.lastRelaunchAt > 0 &&
 				Date.now() - this.lastRelaunchAt < 4000
 			) {
-				// ★ 깜빡임/종료 회귀 방지:
-				//   - 선택창이 "보이려 할 때마다"(ready-to-show/show) 즉시 숨겨 화면 깜빡임을 막는다.
-				//   - 새 선택창은 닫지 않는다. Obsidian 1.12/Electron 39에서는 hidden main window가
-				//     있어도 picker close 가 window-all-closed 종료 흐름을 밟을 수 있다.
-				//   - 대신 작업표시줄에서도 제외하고 기존 창만 전면으로 복원한다.
+				// ★ Avoids both the flicker and the quit regression:
+				//   - Hide the picker every time it tries to appear (ready-to-show/show) so it never paints.
+				//   - Never close it. On Obsidian 1.12 / Electron 39, closing the picker can trigger the
+				//     window-all-closed quit path even when a hidden main window exists.
+				//   - Drop it from the taskbar instead and bring only the existing window forward.
 				const hidePicker = () => {
 					try {
 						if (!w.isDestroyed()) w.hide();
 					} catch {
-						/* 숨김 실패 무시 */
+						/* ignore hide failure */
 					}
 					try {
 						if (!w.isDestroyed()) w.setSkipTaskbar(true);
 					} catch {
-						/* 일부 플랫폼/창에서는 미지원 */
+						/* unsupported on some platforms/windows */
 					}
 				};
 				try {
 					w.on("ready-to-show", hidePicker);
 				} catch {
-					/* 이벤트 미지원 */
+					/* event unsupported */
 				}
 				try {
 					w.on("show", hidePicker);
 				} catch {
-					/* 이벤트 미지원 */
+					/* event unsupported */
 				}
 				window.setTimeout(hidePicker, 0);
 				window.setTimeout(() => {
@@ -346,17 +346,17 @@ export default class BackgroundTrayPlugin extends Plugin {
 						hidePicker();
 						this.showWindow();
 					} catch {
-						/* 창 복원 실패 무시 */
+						/* ignore restore failure */
 					}
 				}, 150);
 			}
 		};
 		try {
-			// 기존 창을 먼저 복원하도록 prepend.
+			// prepend so the existing window is restored first.
 			app.prependListener("second-instance", this.secondInstanceHandler);
 			app.on("browser-window-created", this.windowCreatedHandler);
 		} catch (e) {
-			console.error("Background Tray: single-instance 등록 실패", e);
+			console.error("Background Tray: failed to register single-instance handling", e);
 		}
 	}
 
@@ -370,7 +370,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 						this.secondInstanceHandler
 					);
 			} catch {
-				/* 이미 제거됨 */
+				/* already removed */
 			}
 			try {
 				if (this.windowCreatedHandler)
@@ -379,18 +379,18 @@ export default class BackgroundTrayPlugin extends Plugin {
 						this.windowCreatedHandler
 					);
 			} catch {
-				/* 이미 제거됨 */
+				/* already removed */
 			}
 		}
 		this.secondInstanceHandler = null;
 		this.windowCreatedHandler = null;
 	}
 
-	// ── 트레이 ───────────────────────────────────────────────────────
+	// ── Tray ──────────────────────────────────────
 	private async createTray() {
 		const remote = this.remote;
 		if (!remote) return;
-		this.destroyTray(); // 중복 가드
+		this.destroyTray(); // guard against duplicates
 		try {
 			const { Tray, Menu } = remote;
 			const icon = await this.resolveTrayIcon(remote);
@@ -400,18 +400,18 @@ export default class BackgroundTrayPlugin extends Plugin {
 			this.applyTrayLabels(tray, Menu);
 			tray.on("click", () => this.toggleWindow());
 		} catch (e) {
-			console.error("Background Tray: 트레이 생성 실패", e);
-			new Notice("Background Tray: 트레이 아이콘 생성에 실패했습니다.");
+			console.error("Background Tray: failed to create the tray icon", e);
+			new Notice("Background Tray: failed to create the tray icon.");
 			this.tray = null;
 		}
 	}
 
-	// 트레이 아이콘 결정: 커스텀 경로 → 실제 Obsidian 앱 아이콘 → fallback.
+	// Tray icon: custom path → the real Obsidian app icon → fallback.
 	private async resolveTrayIcon(
 		remote: ElectronRemote
 	): Promise<NativeImageLike> {
 		const { nativeImage, app } = remote;
-		// 1) 사용자 지정 경로
+		// 1) user-supplied path
 		if (this.settings.trayIconPath) {
 			try {
 				const c = nativeImage.createFromPath(
@@ -419,19 +419,19 @@ export default class BackgroundTrayPlugin extends Plugin {
 				);
 				if (!c.isEmpty()) return c;
 			} catch {
-				/* 경로 무효 → 다음 후보 */
+				/* invalid path → next candidate */
 			}
 		}
-		// 2) 실제 Obsidian 실행 파일의 아이콘을 런타임에 추출 (번들 불필요)
+		// 2) extract the icon from the Obsidian executable at runtime (nothing to bundle)
 		try {
 			const img = await app.getFileIcon(process.execPath, {
 				size: "normal",
 			});
 			if (!img.isEmpty()) return img;
 		} catch {
-			/* 아이콘 추출 실패 → fallback */
+			/* extraction failed → fallback */
 		}
-		// 3) 마지막 수단 fallback
+		// 3) last-resort fallback
 		return nativeImage.createFromDataURL(DEFAULT_TRAY_ICON);
 	}
 
@@ -440,14 +440,14 @@ export default class BackgroundTrayPlugin extends Plugin {
 			try {
 				this.tray.destroy();
 			} catch {
-				/* 이미 파괴됨 */
+				/* already destroyed */
 			}
 		}
 		this.tray = null;
 	}
 
-	// 툴팁·우클릭 메뉴에 현재 볼트를 표시한다. 트레이 아이콘이 여러 개(볼트별로 하나씩)
-	// 떠 있을 때 어느 것이 어느 볼트인지 구분하기 위한 핵심 경로. (91 #19)
+	// Show the current vault in the tooltip and the right-click menu. With one tray icon per
+	// vault open, this is what makes the icons tellable apart. (91 #22)
 	private applyTrayLabels(
 		tray: ElectronTray,
 		Menu: ElectronRemote["Menu"]
@@ -456,12 +456,12 @@ export default class BackgroundTrayPlugin extends Plugin {
 		try {
 			tray.setToolTip(this.renderTooltip(vault));
 		} catch (e) {
-			console.error("Background Tray: 툴팁 설정 실패", e);
+			console.error("Background Tray: failed to set the tooltip", e);
 		}
 		try {
 			tray.setContextMenu(
 				Menu.buildFromTemplate([
-					// 비활성 헤더 — 클릭 불가, 어느 볼트인지 알려주는 용도.
+					// Disabled header — not clickable, it just says which vault this icon belongs to.
 					{ label: vault, enabled: false },
 					{ type: "separator" },
 					{ label: "Show / Hide", click: () => this.toggleWindow() },
@@ -477,20 +477,20 @@ export default class BackgroundTrayPlugin extends Plugin {
 				])
 			);
 		} catch (e) {
-			console.error("Background Tray: 컨텍스트 메뉴 설정 실패", e);
+			console.error("Background Tray: failed to set the context menu", e);
 		}
 	}
 
-	// 볼트명을 여러 경로로 확보한다. app.vault.getName() 이 빈 문자열을 돌려주는 환경이
-	// 있어(1.0.7 이하에서 툴팁이 모든 볼트에서 똑같이 보이던 원인) 폴백을 둔다.
+	// Resolve the vault name through several routes: app.vault.getName() returns an empty string
+	// in some environments, which is why every tray tooltip looked identical up to 1.0.7.
 	resolveVaultName(): string {
 		try {
 			const name = this.app.vault.getName();
 			if (name && name.trim()) return name.trim();
 		} catch {
-			/* API 접근 실패 → 다음 후보 */
+			/* API unreachable → next candidate */
 		}
-		// 보관함 폴더 경로의 마지막 조각
+		// last segment of the vault folder path
 		try {
 			const adapter = this.app.vault.adapter as unknown as {
 				getBasePath?: () => string;
@@ -498,7 +498,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 			};
 			const base = adapter?.getBasePath?.() ?? adapter?.basePath;
 			if (base) {
-				// 구분자를 "/" 로 통일한 뒤 마지막 조각 = 볼트 폴더명.
+				// Normalise separators to "/" — the last segment is the vault folder name.
 				const seg = base
 					.split("\\")
 					.join("/")
@@ -508,9 +508,9 @@ export default class BackgroundTrayPlugin extends Plugin {
 				if (seg && seg.trim()) return seg.trim();
 			}
 		} catch {
-			/* 어댑터 접근 실패 → 다음 후보 */
+			/* adapter unreachable → next candidate */
 		}
-		// 창 제목 "<노트> - <볼트> - Obsidian v1.x" 의 끝에서 두 번째 조각
+		// Window title "<note> - <vault> - Obsidian v1.x" → second-to-last segment
 		try {
 			const parts = document.title.split(" - ");
 			if (parts.length >= 2) {
@@ -518,7 +518,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 				if (cand) return cand;
 			}
 		} catch {
-			/* document 접근 불가 → 최종 폴백 */
+			/* document unreachable → final fallback */
 		}
 		return "Obsidian";
 	}
@@ -527,11 +527,11 @@ export default class BackgroundTrayPlugin extends Plugin {
 		const template =
 			this.settings.trayTooltip?.trim() || DEFAULT_SETTINGS.trayTooltip;
 		const text = template.replace(/\{\{vault\}\}/g, vault).trim();
-		// 템플릿이 통째로 비면 최소한 볼트명은 남긴다. Win32 szTip 은 127자 제한.
+		// If the template renders empty, keep at least the vault name. Win32 szTip caps at 127 chars.
 		return (text || vault).slice(0, 127);
 	}
 
-	// ── 창 동작 ──────────────────────────────────────────────────────
+	// ── Window actions ───────────────────────────────
 	toggleWindow() {
 		const win = this.win;
 		if (!win) return;
@@ -542,7 +542,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 				this.showWindow();
 			}
 		} catch (e) {
-			console.error("Background Tray: toggleWindow 실패", e);
+			console.error("Background Tray: toggleWindow failed", e);
 		}
 	}
 
@@ -554,7 +554,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 			win.show();
 			win.focus();
 		} catch {
-			/* 창 복귀 실패 무시 */
+			/* ignore restore failure */
 		}
 	}
 
@@ -564,7 +564,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 		try {
 			win.hide();
 		} catch {
-			/* 창 숨김 실패 무시 */
+			/* ignore hide failure */
 		}
 	}
 
@@ -574,11 +574,11 @@ export default class BackgroundTrayPlugin extends Plugin {
 			if (this.win) this.win.close();
 			else this.remote?.app?.quit();
 		} catch (e) {
-			console.error("Background Tray: quit 실패", e);
+			console.error("Background Tray: quit failed", e);
 			try {
 				this.remote?.app?.quit();
 			} catch {
-				/* 종료 실패 무시 */
+				/* ignore quit failure */
 			}
 		}
 	}
@@ -589,7 +589,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 			this.remote?.app?.relaunch();
 			this.remote?.app?.exit(0);
 		} catch (e) {
-			console.error("Background Tray: relaunch 실패", e);
+			console.error("Background Tray: relaunch failed", e);
 		}
 	}
 
@@ -604,7 +604,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	// 툴팁·메뉴 라벨만 다시 적용한다 (아이콘 재추출·깜빡임 없음).
+	// Re-apply only the tooltip and menu labels (no icon re-extraction, no flicker).
 	refreshTrayLabels() {
 		const tray = this.tray;
 		const remote = this.remote;
@@ -612,7 +612,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.applyTrayLabels(tray, remote.Menu);
 	}
 
-	// 설정 변경 시 트레이를 다시 만들어 즉시 반영
+	// Rebuild the tray so setting changes take effect immediately
 	async refreshTray() {
 		this.destroyTray();
 		if (this.remote && this.settings.createTrayIcon)
@@ -634,7 +634,7 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Run in background")
-			.setDesc("창을 닫아도 종료하지 않고 트레이로 숨깁니다.")
+			.setDesc("Closing the window (X) hides Obsidian to the tray instead of quitting.")
 			.addToggle((t) =>
 				t
 					.setValue(this.plugin.settings.runInBackground)
@@ -646,7 +646,7 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Create tray icon")
-			.setDesc("시스템 트레이에 아이콘을 만듭니다. (좌클릭: 표시/숨김 토글)")
+			.setDesc("Add an icon to the system tray. Left-click toggles show/hide.")
 			.addToggle((t) =>
 				t
 					.setValue(this.plugin.settings.createTrayIcon)
@@ -660,7 +660,7 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Focus existing window on relaunch")
 			.setDesc(
-				"트레이에 숨은 상태에서 Obsidian을 다시 실행하면 새 보관함 선택창 대신 기존 창을 복원합니다."
+				"Relaunching Obsidian while it is hidden in the tray restores the existing window instead of opening the vault picker."
 			)
 			.addToggle((t) =>
 				t
@@ -674,7 +674,7 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Tray icon image")
 			.setDesc(
-				"커스텀 트레이 아이콘의 절대 경로 (비우면 Obsidian 기본 아이콘, 16x16 권장)."
+				"Absolute path to a custom tray icon. Leave empty to use Obsidian's own icon (16x16 recommended)."
 			)
 			.addText((txt) =>
 				txt
@@ -690,7 +690,7 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Tray tooltip")
 			.setDesc(
-				`{{vault}} → 볼트명으로 치환됩니다. 현재 볼트: "${this.plugin.resolveVaultName()}"`
+				`{{vault}} is replaced with the vault name. Current vault: "${this.plugin.resolveVaultName()}"`
 			)
 			.addText((txt) =>
 				txt
