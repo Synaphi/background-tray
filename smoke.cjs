@@ -28,7 +28,7 @@ const fakeWin = {
   close(){ log.quit++; }, setSkipTaskbar(){}, isDestroyed(){ return false; }, id:1,
 };
 class Tray { constructor(i){ this.icon=i; log.trayCreated++; } setToolTip(t){ log.tooltip=t; } setContextMenu(){} on(){} destroy(){ log.trayDestroyed++; } }
-const Menu = { buildFromTemplate(t){ return {_t:t}; } };
+const Menu = { buildFromTemplate(t){ log.menuTemplate=t; return {_t:t}; } };
 const nativeImage = { createFromPath(){ return {isEmpty(){return true;}}; }, createFromDataURL(){ return {isEmpty(){return false;}}; }, createEmpty(){ return {}; } };
 // app(main 프로세스) 이벤트 레지스트리 — 단일 인스턴스(재실행) 경로 검증용.
 const appEvents = {};
@@ -57,8 +57,11 @@ global.window = {
   setTimeout: (fn, t) => setTimeout(fn, t),
 };
 
+global.document = { title: "Some note - TitleVault - Obsidian v1.12.0" };
+
 const PluginClass = require("./main.js").default || require("./main.js");
-const app = { vault:{ getName(){ return "TestVault"; } } };
+const mkApp = (vault) => ({ vault, workspace:{ onLayoutReady(cb){ cb(); } } });
+const app = mkApp({ getName(){ return "TestVault"; }, adapter:{ getBasePath(){ return "C:\\Obsidian\\TestVault"; } } });
 const p = new PluginClass(app, { id:"background-tray" });
 
 (async () => {
@@ -66,7 +69,8 @@ const p = new PluginClass(app, { id:"background-tray" });
   await p.onload();
   ok(log.trayCreated===1, "트레이 1개 생성");
   ok((log.listeners["close"]||[]).length===1, "close 리스너 1개 등록");
-  ok(p._commands.length===0, "커맨드 미등록(단일목적·단축키 버튼 제거)");
+  ok(p._commands.length===3, "커맨드 3개 등록(show/hide/toggle)");
+  ok(p._commands.map(c=>c.id).sort().join(",")==="hide-window,show-window,toggle-window", "커맨드 id = show/hide/toggle-window");
   // 닫기 시뮬레이션: runInBackground 기본 ON → preventDefault + hide
   let prevented=false; const ev={preventDefault(){prevented=true;}};
   (log.listeners["close"]||[]).forEach(fn=>fn(ev));
@@ -76,7 +80,9 @@ const p = new PluginClass(app, { id:"background-tray" });
   p.toggleWindow();
   ok(log.shown===1 && log.focused===1, "toggleWindow 로 창 복귀");
   // ── 트레이 툴팁 기본값(작업 1) ──
-  ok(log.tooltip==="TestVault - Background Tray", "트레이 툴팁 = '<vault> - Background Tray'");
+  ok(log.tooltip==="TestVault — Obsidian", "트레이 툴팁 = '<vault> — Obsidian'");
+  ok(log.menuTemplate[0].label==="TestVault" && log.menuTemplate[0].enabled===false, "우클릭 메뉴 첫 항목 = 볼트명(비활성 헤더)");
+  ok(log.menuTemplate.some(i=>i.label==="Show / Hide") && log.menuTemplate.some(i=>i.label==="Quit completely"), "메뉴 헤더 추가 후에도 기존 항목 유지");
   // ── 단일 인스턴스 재실행 깜빡임 수정(작업 2) ──
   //   작업표시줄에서 다시 켜면 second-instance → 기존 창 복원 + 보관함 선택창 즉시 숨김.
   ok((appEvents["second-instance"]||[]).length===1, "second-instance 리스너 등록");
@@ -104,6 +110,18 @@ const p = new PluginClass(app, { id:"background-tray" });
   ok((appEvents["second-instance"]||[]).length===0 && (appEvents["browser-window-created"]||[]).length===0, "onunload: single-instance 리스너 제거(누수 0)");
   ok((log.listeners["close"]||[]).length===0, "onunload: close 리스너 제거(누수 0)");
   ok(log.trayDestroyed===1, "onunload: 트레이 destroy");
+  // ── 볼트명 폴백 체인(1.0.8 버그 수정: 모든 볼트에서 툴팁이 같아 보이던 문제) ──
+  const pFallback = new PluginClass(mkApp({ getName(){ return "   "; }, adapter:{ getBasePath(){ return "D:\\Vaults\\PathVault\\"; } } }), {id:"background-tray"});
+  await pFallback.onload();
+  ok(log.tooltip==="PathVault — Obsidian", "getName() 빈값 → 보관함 경로에서 볼트명 복구");
+  ok(log.menuTemplate[0].label==="PathVault", "폴백 볼트명이 메뉴 헤더에도 반영");
+  pFallback.onunload();
+
+  const pTitle = new PluginClass(mkApp({ getName(){ return ""; }, adapter:{} }), {id:"background-tray"});
+  await pTitle.onload();
+  ok(log.tooltip==="TitleVault — Obsidian", "getName()·경로 모두 실패 → 창 제목에서 볼트명 복구");
+  pTitle.onunload();
+
   // quitCompletely: reallyQuitting 우회 후 close
   const p2 = new PluginClass(app, {id:"background-tray"}); await p2.onload();
   p2.quitCompletely();

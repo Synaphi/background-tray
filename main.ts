@@ -48,6 +48,7 @@ interface ElectronTray {
 interface MenuItemTemplate {
 	label?: string;
 	type?: string;
+	enabled?: boolean;
 	click?: () => void;
 }
 
@@ -92,7 +93,7 @@ const DEFAULT_SETTINGS: BackgroundTraySettings = {
 	createTrayIcon: true,
 	focusOnRelaunch: true,
 	trayIconPath: "",
-	trayTooltip: "{{vault}} - Background Tray",
+	trayTooltip: "{{vault}} — Obsidian",
 };
 
 // 렌더러에서 Electron main 프로세스 모듈을 가져온다. 빌드별 경로 차이 → fallback.
@@ -164,6 +165,10 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.registerSingleInstance();
 
 		if (this.settings.createTrayIcon) await this.createTray();
+
+		// 일부 환경에서 onload 시점의 app.vault.getName() 이 아직 비어 있다 → 레이아웃
+		// 준비 후 볼트명을 한 번 더 확보해 트레이 라벨에 반영한다.
+		this.app.workspace?.onLayoutReady?.(() => this.refreshTrayLabels());
 
 		this.addCommand({
 			id: "toggle-window",
@@ -392,18 +397,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 			const tray = new Tray(icon);
 			this.tray = tray;
-			tray.setToolTip(this.renderTooltip());
-
-			const menu = Menu.buildFromTemplate([
-				{ label: "Show / Hide", click: () => this.toggleWindow() },
-				{ type: "separator" },
-				{ label: "Relaunch Obsidian", click: () => this.relaunch() },
-				{
-					label: "Quit completely",
-					click: () => this.quitCompletely(),
-				},
-			]);
-			tray.setContextMenu(menu);
+			this.applyTrayLabels(tray, Menu);
 			tray.on("click", () => this.toggleWindow());
 		} catch (e) {
 			console.error("Background Tray: 트레이 생성 실패", e);
@@ -452,11 +446,89 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.tray = null;
 	}
 
-	private renderTooltip(): string {
-		const vault = this.app.vault.getName();
-		return (
-			this.settings.trayTooltip || "{{vault}} - Background Tray"
-		).replace(/\{\{vault\}\}/g, vault);
+	// 툴팁·우클릭 메뉴에 현재 볼트를 표시한다. 트레이 아이콘이 여러 개(볼트별로 하나씩)
+	// 떠 있을 때 어느 것이 어느 볼트인지 구분하기 위한 핵심 경로. (91 #19)
+	private applyTrayLabels(
+		tray: ElectronTray,
+		Menu: ElectronRemote["Menu"]
+	) {
+		const vault = this.resolveVaultName();
+		try {
+			tray.setToolTip(this.renderTooltip(vault));
+		} catch (e) {
+			console.error("Background Tray: 툴팁 설정 실패", e);
+		}
+		try {
+			tray.setContextMenu(
+				Menu.buildFromTemplate([
+					// 비활성 헤더 — 클릭 불가, 어느 볼트인지 알려주는 용도.
+					{ label: vault, enabled: false },
+					{ type: "separator" },
+					{ label: "Show / Hide", click: () => this.toggleWindow() },
+					{ type: "separator" },
+					{
+						label: "Relaunch Obsidian",
+						click: () => this.relaunch(),
+					},
+					{
+						label: "Quit completely",
+						click: () => this.quitCompletely(),
+					},
+				])
+			);
+		} catch (e) {
+			console.error("Background Tray: 컨텍스트 메뉴 설정 실패", e);
+		}
+	}
+
+	// 볼트명을 여러 경로로 확보한다. app.vault.getName() 이 빈 문자열을 돌려주는 환경이
+	// 있어(1.0.7 이하에서 툴팁이 모든 볼트에서 똑같이 보이던 원인) 폴백을 둔다.
+	resolveVaultName(): string {
+		try {
+			const name = this.app.vault.getName();
+			if (name && name.trim()) return name.trim();
+		} catch {
+			/* API 접근 실패 → 다음 후보 */
+		}
+		// 보관함 폴더 경로의 마지막 조각
+		try {
+			const adapter = this.app.vault.adapter as unknown as {
+				getBasePath?: () => string;
+				basePath?: string;
+			};
+			const base = adapter?.getBasePath?.() ?? adapter?.basePath;
+			if (base) {
+				// 구분자를 "/" 로 통일한 뒤 마지막 조각 = 볼트 폴더명.
+				const seg = base
+					.split("\\")
+					.join("/")
+					.split("/")
+					.filter((part) => part.trim())
+					.pop();
+				if (seg && seg.trim()) return seg.trim();
+			}
+		} catch {
+			/* 어댑터 접근 실패 → 다음 후보 */
+		}
+		// 창 제목 "<노트> - <볼트> - Obsidian v1.x" 의 끝에서 두 번째 조각
+		try {
+			const parts = document.title.split(" - ");
+			if (parts.length >= 2) {
+				const cand = parts[parts.length - 2]?.trim();
+				if (cand) return cand;
+			}
+		} catch {
+			/* document 접근 불가 → 최종 폴백 */
+		}
+		return "Obsidian";
+	}
+
+	private renderTooltip(vault = this.resolveVaultName()): string {
+		const template =
+			this.settings.trayTooltip?.trim() || DEFAULT_SETTINGS.trayTooltip;
+		const text = template.replace(/\{\{vault\}\}/g, vault).trim();
+		// 템플릿이 통째로 비면 최소한 볼트명은 남긴다. Win32 szTip 은 127자 제한.
+		return (text || vault).slice(0, 127);
 	}
 
 	// ── 창 동작 ──────────────────────────────────────────────────────
@@ -530,6 +602,14 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+
+	// 툴팁·메뉴 라벨만 다시 적용한다 (아이콘 재추출·깜빡임 없음).
+	refreshTrayLabels() {
+		const tray = this.tray;
+		const remote = this.remote;
+		if (!tray || !remote) return;
+		this.applyTrayLabels(tray, remote.Menu);
 	}
 
 	// 설정 변경 시 트레이를 다시 만들어 즉시 반영
@@ -609,14 +689,17 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Tray tooltip")
-			.setDesc("{{vault}} → 볼트명으로 치환됩니다.")
+			.setDesc(
+				`{{vault}} → 볼트명으로 치환됩니다. 현재 볼트: "${this.plugin.resolveVaultName()}"`
+			)
 			.addText((txt) =>
 				txt
+					.setPlaceholder("{{vault}} — Obsidian")
 					.setValue(this.plugin.settings.trayTooltip)
 					.onChange(async (v) => {
 						this.plugin.settings.trayTooltip = v;
 						await this.plugin.saveSettings();
-						await this.plugin.refreshTray();
+						this.plugin.refreshTrayLabels();
 					})
 			);
 	}

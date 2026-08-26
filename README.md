@@ -19,9 +19,10 @@ A robust, modern reimplementation of the (now unmaintained) `obsidian-tray`, bui
 ## Features
 
 - **Run in background** — closing the window (X) hides Obsidian to the tray instead of quitting.
-- **Tray icon** — left-click toggles show/hide; right-click menu: Show/Hide, Relaunch, Quit completely. Uses Obsidian's own app icon by default.
+- **Tray icon** — left-click toggles show/hide; right-click menu is headed by the vault name, then Show/Hide, Relaunch, Quit completely. Uses Obsidian's own app icon by default.
 - **Single-instance focus** — relaunching Obsidian while it's hidden in the tray restores the existing window instead of opening the vault switcher. (Toggle in settings.)
 - **Quit completely / Relaunch** — from the tray icon's right-click menu.
+- **Tells your vaults apart** — with several vaults open you get one tray icon each; the tooltip and the right-click menu header both show that icon's vault name.
 - **Custom tray icon & tooltip** — `{{vault}}` is replaced with the vault name.
 - Turning the plugin off restores all default behaviour completely (no leftover listeners).
 
@@ -38,6 +39,13 @@ Settings → Community plugins.
 ## Usage
 
 Close the window and Obsidian keeps running in the tray — and so does your sync. Click the tray icon to bring it back. To actually quit, right-click the tray icon and choose **Quit completely**.
+
+## What's new in 1.0.8
+
+- **Fix:** with several vaults open, every tray icon showed the same tooltip. Each icon now shows its own vault name.
+- The tray icon's right-click menu is headed by the vault name, so you can tell the icons apart without hovering.
+- Default tray tooltip is now `{{vault}} — Obsidian`.
+- Command-palette entries are back (**Show window**, **Hide window**, **Show / Hide window**) for hotkey binding — thanks to [@theruansilva](https://github.com/theruansilva) ([#2](https://github.com/Synaphi/background-tray/pull/2)).
 
 ## What's new in 1.0.7
 
