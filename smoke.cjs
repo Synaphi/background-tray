@@ -16,7 +16,7 @@ let notices=[]; class Notice { constructor(m){ notices.push(m); } }
 const obsidianStub = { Plugin, PluginSettingTab, Setting, Notice, App: class {} };
 
 // ── @electron/remote stub ──
-const log = { listeners:{}, hidden:0, shown:0, focused:0, trayCreated:0, trayDestroyed:0, prevented:0, quit:0 };
+const log = { listeners:{}, hidden:0, shown:0, focused:0, trayCreated:0, trayDestroyed:0, prevented:0, quit:0, appQuit:0, closeSeq:[] };
 const fakeWin = {
   _visible:true, _min:false,
   on(ev,fn){ (log.listeners[ev]=log.listeners[ev]||[]).push(fn); },
@@ -25,7 +25,7 @@ const fakeWin = {
   show(){ this._visible=true; log.shown++; },
   focus(){ log.focused++; },
   isVisible(){ return this._visible; }, isMinimized(){ return this._min; }, restore(){ this._min=false; },
-  close(){ log.quit++; }, setSkipTaskbar(){}, isDestroyed(){ return false; }, id:1,
+  close(){ log.quit++; log.closeSeq.push("win.close"); }, setSkipTaskbar(){}, isDestroyed(){ return false; }, id:1,
 };
 class Tray { constructor(i){ this.icon=i; log.trayCreated++; } setToolTip(t){ log.tooltip=t; } setContextMenu(){} on(){} destroy(){ log.trayDestroyed++; } }
 const Menu = { buildFromTemplate(t){ log.menuTemplate=t; return {_t:t}; } };
@@ -33,7 +33,7 @@ const nativeImage = { createFromPath(){ return {isEmpty(){return true;}}; }, cre
 // Registry of app (main-process) events — used to exercise the single-instance relaunch path.
 const appEvents = {};
 const remoteStub = { getCurrentWindow(){ return fakeWin; }, Tray, Menu, nativeImage, app:{
-  quit(){log.quit++;}, relaunch(){}, exit(){}, dock:{show(){}},
+  quit(){log.quit++; log.appQuit++;}, relaunch(){}, exit(){}, dock:{show(){}},
   async getFileIcon(){ return {isEmpty(){return true;}}; },
   prependListener(ev,fn){ (appEvents[ev]=appEvents[ev]||[]).unshift(fn); },
   on(ev,fn){ (appEvents[ev]=appEvents[ev]||[]).push(fn); },
@@ -91,12 +91,13 @@ const p = new PluginClass(app, { id:"background-tray" });
   remoteStub.app._emit("second-instance");
   ok(log.shown>shownBefore, "relaunch restores the existing window (show)");
   // The vault picker Obsidian opens right after (a new window, id=2) — supports show/ready-to-show.
-  const picker={ id:2, _visible:true, hidden:0, closed:0, skipTaskbar:false, _ev:{},
+  const mkPicker=(id)=>({ id, _visible:true, hidden:0, closed:0, destroyed:0, skipTaskbar:false, _ev:{},
     on(ev,fn){ (this._ev[ev]=this._ev[ev]||[]).push(fn); },
     fire(ev){ (this._ev[ev]||[]).forEach(f=>f()); },
-    hide(){ this._visible=false; this.hidden++; }, close(){ this.closed++; },
+    hide(){ this._visible=false; this.hidden++; }, close(){ this.closed++; }, destroy(){ this.destroyed++; },
     setSkipTaskbar(v){ this.skipTaskbar=v; },
-    isDestroyed(){ return this.closed>0; }, isVisible(){ return this._visible; } };
+    isDestroyed(){ return this.closed>0 || this.destroyed>0; }, isVisible(){ return this._visible; }, isResizable(){ return false; } });
+  const picker=mkPicker(2);
   remoteStub.app._emit("browser-window-created", {preventDefault(){}}, picker);
   picker.fire("ready-to-show");
   picker.fire("show");
@@ -105,8 +106,16 @@ const p = new PluginClass(app, { id:"background-tray" });
   ok(picker.closed===0, "vault picker: never closed (guards the window-all-closed regression)");
   ok(picker.skipTaskbar===true, "vault picker: dropped from the taskbar");
   ok(log.quit===quitBefore, "★regression guard: the running Obsidian is never quit or closed");
+  ok(picker.destroyed===0, "vault picker: kept alive while Obsidian keeps running");
+  // A resizable window (another vault opened via obsidian:// link, or a pop-out) in the same 4 s must be left alone.
+  const vaultWin=mkPicker(9); vaultWin.isResizable=()=>true;
+  remoteStub.app._emit("browser-window-created", {preventDefault(){}}, vaultWin);
+  vaultWin.fire("show");
+  ok(vaultWin.hidden===0 && vaultWin.skipTaskbar===false, "resizable window created right after relaunch (vault window / pop-out): never hidden");
   // onunload: full cleanup (zero leaks)
   p.onunload();
+  ok(picker.destroyed===1, "onunload: the hidden vault picker is destroyed (issue #3: no headless leftover)");
+  ok(vaultWin.destroyed===0, "onunload: the vault window is not tracked, so it is not destroyed");
   ok((appEvents["second-instance"]||[]).length===0 && (appEvents["browser-window-created"]||[]).length===0, "onunload: single-instance listeners removed (zero leaks)");
   ok((log.listeners["close"]||[]).length===0, "onunload: close listener removed (zero leaks)");
   ok(log.trayDestroyed===1, "onunload: tray destroyed");
@@ -122,14 +131,44 @@ const p = new PluginClass(app, { id:"background-tray" });
   ok(log.tooltip==="TitleVault — Obsidian", "getName() and path both fail → vault name recovered from the window title");
   pTitle.onunload();
 
-  // quitCompletely: bypasses the interception via reallyQuitting, then closes
+  // ── issue #3: Quit completely must end the whole app, even with a hidden vault picker around ──
+  //   Obsidian only quits on window-all-closed; a hidden picker left behind kept the process alive with no window.
   const p2 = new PluginClass(app, {id:"background-tray"}); await p2.onload();
+  remoteStub.app._emit("second-instance");
+  const picker2=mkPicker(3);
+  remoteStub.app._emit("browser-window-created", {preventDefault(){}}, picker2);
+  picker2.fire("show");
+  const appQuitBefore=log.appQuit; log.closeSeq=[];
+  picker2.destroy=function(){ this.destroyed++; log.closeSeq.push("picker.destroy"); };
   p2.quitCompletely();
-  ok(log.quit>=1, "quitCompletely: takes the real quit path");
+  ok(log.closeSeq.join(">")==="picker.destroy>win.close", "quitCompletely: destroys the hidden vault picker, THEN closes our window (order verified)");
+  ok(log.appQuit===appQuitBefore, "quitCompletely: closes only this vault's window — never app.quit() (other open vaults keep running)");
   // Bypass check: while reallyQuitting, a close event must not be preventDefault-ed
   let prevented2=false; (log.listeners["close"]||[]).forEach(fn=>fn({preventDefault(){prevented2=true;}}));
   ok(prevented2===false, "close interception is bypassed while reallyQuitting");
   p2.onunload();
+
+  // ── issue #3 (b): a real close with "Run in background" OFF also takes the hidden picker along ──
+  const p3 = new PluginClass(app, {id:"background-tray"}); await p3.onload();
+  p3.settings.runInBackground=false;
+  remoteStub.app._emit("second-instance");
+  const picker3=mkPicker(4);
+  remoteStub.app._emit("browser-window-created", {preventDefault(){}}, picker3);
+  const hiddenBefore3=log.hidden;
+  let prevented3=false; (log.listeners["close"]||[]).forEach(fn=>fn({preventDefault(){prevented3=true;}}));
+  ok(prevented3===false && log.hidden===hiddenBefore3, "run-in-background OFF: close is not intercepted");
+  ok(picker3.destroyed===1, "run-in-background OFF: the hidden vault picker is destroyed on the real close");
+  p3.onunload();
+
+  // ── issue #3 (c): turning "Focus existing window on relaunch" off releases the hidden picker ──
+  const p4 = new PluginClass(app, {id:"background-tray"}); await p4.onload();
+  remoteStub.app._emit("second-instance");
+  const picker4=mkPicker(5);
+  remoteStub.app._emit("browser-window-created", {preventDefault(){}}, picker4);
+  // The Setting stub swallows onChange callbacks, so call what the toggle's onChange(false) calls.
+  p4.settings.focusOnRelaunch=false; p4.destroyHiddenPickers();
+  ok(picker4.destroyed===1, "focusOnRelaunch OFF: the hidden vault picker is destroyed");
+  p4.onunload();
   console.log(fail===0 ? "\nALL PASS" : `\n${fail} FAIL`);
   process.exit(fail===0?0:1);
 })();

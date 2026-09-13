@@ -29,9 +29,11 @@ interface ElectronWindow {
 	focus(): void;
 	restore(): void;
 	close(): void;
+	destroy(): void;
 	isVisible(): boolean;
 	isMinimized(): boolean;
 	isDestroyed(): boolean;
+	isResizable(): boolean;
 	setSkipTaskbar(skip: boolean): void;
 	on(event: "close", listener: (e: ElectronEvent) => void): void;
 	on(event: "ready-to-show" | "show", listener: () => void): void;
@@ -134,6 +136,9 @@ export default class BackgroundTrayPlugin extends Plugin {
 		| null = null;
 	private lastRelaunchAt = 0;
 	private reallyQuitting = false;
+	// Vault pickers we hid on relaunch (never closed, see registerSingleInstance). They must go
+	// away before the main window does, or Obsidian never reaches window-all-closed (issue #3).
+	private hiddenPickers: ElectronWindow[] = [];
 
 	async onload() {
 		await this.loadSettings();
@@ -194,6 +199,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.removeBeforeUnload();
 		this.removeCloseInterception();
 		this.removeSingleInstance();
+		this.destroyHiddenPickers();
 		this.destroyTray();
 		try {
 			this.win?.setSkipTaskbar(false);
@@ -249,7 +255,11 @@ export default class BackgroundTrayPlugin extends Plugin {
 			if (this.settings.runInBackground && !this.reallyQuitting) {
 				e.preventDefault();
 				win.hide();
+				return;
 			}
+			// The window is really going away: a hidden picker left behind would keep the
+			// process alive with no window and no tray.
+			this.destroyHiddenPickers();
 		};
 		try {
 			win.on("close", this.closeHandler);
@@ -311,6 +321,16 @@ export default class BackgroundTrayPlugin extends Plugin {
 				this.lastRelaunchAt > 0 &&
 				Date.now() - this.lastRelaunchAt < 4000
 			) {
+				// Obsidian builds the picker with resizable:false; vault windows and pop-outs are
+				// resizable. A relaunch via an obsidian:// link can open another vault in that same
+				// window of time — leave anything resizable alone.
+				let resizable = true;
+				try {
+					resizable = w.isResizable();
+				} catch {
+					/* unknown → treat as a vault window */
+				}
+				if (resizable) return;
 				// ★ Avoids both the flicker and the quit regression:
 				//   - Hide the picker every time it tries to appear (ready-to-show/show) so it never paints.
 				//   - Never close it. On Obsidian 1.12 / Electron 39, closing the picker can trigger the
@@ -338,6 +358,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 				} catch {
 					/* event unsupported */
 				}
+				this.hiddenPickers.push(w);
 				window.setTimeout(hidePicker, 0);
 				window.setTimeout(() => {
 					try {
@@ -384,6 +405,19 @@ export default class BackgroundTrayPlugin extends Plugin {
 		}
 		this.secondInstanceHandler = null;
 		this.windowCreatedHandler = null;
+	}
+
+	// Destroy (not close) the pickers we kept hidden. destroy() skips the close/beforeunload
+	// round trip; Obsidian's own picker "closed" handler only clears its reference.
+	destroyHiddenPickers() {
+		for (const w of this.hiddenPickers) {
+			try {
+				if (!w.isDestroyed()) w.destroy();
+			} catch {
+				/* already gone */
+			}
+		}
+		this.hiddenPickers = [];
 	}
 
 	// ── Tray ──────────────────────────────────────
@@ -570,6 +604,11 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 	quitCompletely() {
 		this.reallyQuitting = true;
+		// Drop the hidden vault picker first: Obsidian only exits on window-all-closed, so a picker
+		// left behind kept the process alive with no window and no tray (issue #3). Then close just
+		// our window — not app.quit(): with several vaults open, quitting from one tray icon must
+		// not pull the other vaults down (their plugin instances would veto and hide instead).
+		this.destroyHiddenPickers();
 		try {
 			if (this.win) this.win.close();
 			else this.remote?.app?.quit();
@@ -668,6 +707,9 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 					.onChange(async (v) => {
 						this.plugin.settings.focusOnRelaunch = v;
 						await this.plugin.saveSettings();
+						// Off: let go of any picker we hid, or Obsidian's next relaunch would
+						// focus that invisible window and show nothing.
+						if (!v) this.plugin.destroyHiddenPickers();
 					})
 			);
 

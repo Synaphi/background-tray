@@ -29,6 +29,16 @@ rules lives in the Obsidian vault** (written in Korean). Read it before touching
   Obsidian Sync, so deploying from two machines at once makes `main.js` overwrite itself.
   CI cannot verify tray/Electron behaviour — the smoke test missed the 1.0.5 and 1.0.6 quit
   regressions, so always verify in a real Obsidian before tagging.
+- **Version scheme (since 2026-09-13)**: the version *is* the date — `<year>.<MM>.<DD>` with the
+  first number counting years since 2026 (`1.09.13` = 2026-09-13, `2.01.05` = 2027-01-05). A second
+  release on the same day appends a fourth number: `1.09.13.2`. Never use letter suffixes: Obsidian
+  compares versions with `parseInt` per dot-part, so `1.09.13a` and `1.09.13b` are the same version
+  to it and the second one is never offered as an update. Bump `manifest.json`, `package.json` and
+  `versions.json` together by hand; the git tag must equal `manifest.json` version exactly.
+  Do not run `npm version` — npm normalises `1.09.14` to `1.9.14`, which would not match the tag.
+- **Release order**: push the tag first, wait for the Actions draft, publish it, THEN push `main`.
+  Obsidian reads `manifest.json` from `main` to advertise updates, so pushing `main` first
+  advertises a version whose download URL still 404s until the draft is published.
 - **Scope**: one job only — run in background + tray icon. Extra features were deliberately
   dropped to keep the plugin small.
 
