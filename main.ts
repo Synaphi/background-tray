@@ -26,6 +26,7 @@ interface ElectronWindow {
 	id: number;
 	hide(): void;
 	show(): void;
+	showInactive(): void;
 	focus(): void;
 	restore(): void;
 	close(): void;
@@ -61,6 +62,7 @@ interface ElectronApp {
 		listener: (e: ElectronEvent, w: ElectronWindow) => void
 	): void;
 	removeListener(event: string, listener: ElectronListener): void;
+	emit(event: string): boolean;
 	quit(): void;
 	relaunch(): void;
 	exit(code: number): void;
@@ -139,6 +141,14 @@ export default class BackgroundTrayPlugin extends Plugin {
 	// Vault pickers we hid on relaunch (never closed, see registerSingleInstance). They must go
 	// away before the main window does, or Obsidian never reaches window-all-closed (issue #3).
 	private hiddenPickers: ElectronWindow[] = [];
+	// Secondary windows of this vault (pop-out tabs, the Settings window) that we hid together
+	// with the main window, to bring back on show (issue #3 follow-up).
+	private hiddenSecondaries: ElectronWindow[] = [];
+	// DOM windows opened from this vault via window.open — that is how Obsidian creates every
+	// pop-out and the Settings window. Tracked so hide/show can treat the vault as one unit.
+	private openedWindows = new Set<Window>();
+	private originalWindowOpen: typeof window.open | null = null;
+	private windowOpenWrapper: typeof window.open | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -168,6 +178,8 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.registerCloseInterception();
 		// Restore the existing window when relaunched while hidden (and suppress the vault picker).
 		this.registerSingleInstance();
+		// Know about the pop-out / Settings windows this vault opens, so hiding hides them too.
+		this.patchWindowOpen();
 
 		if (this.settings.createTrayIcon) await this.createTray();
 
@@ -199,7 +211,10 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.removeBeforeUnload();
 		this.removeCloseInterception();
 		this.removeSingleInstance();
+		this.unpatchWindowOpen();
 		this.destroyHiddenPickers();
+		// Never leave a pop-out invisible with no way to get it back.
+		this.restoreSecondaries();
 		this.destroyTray();
 		try {
 			this.win?.setSkipTaskbar(false);
@@ -226,24 +241,173 @@ export default class BackgroundTrayPlugin extends Plugin {
 				e.preventDefault();
 				// Electron: cancel the close (returnValue is a deprecated type → cast around it)
 				(e as { returnValue: boolean }).returnValue = false;
-				try {
-					this.win?.hide(); // hide to the tray
-				} catch {
-					/* ignore hide failure */
-				}
+				// ★ Stop Obsidian's own quit hook (window.onbeforeunload) from running: it treats
+				// any close of the main window as a quit, fires workspace "quit" and CLOSES every
+				// pop-out and the Settings window — which is why they never came back after a hide.
+				// We are hiding, not quitting; that hook still runs on a real quit (reallyQuitting).
+				e.stopImmediatePropagation();
+				this.hideWindow(); // hide to the tray
 			}
 		};
-		window.addEventListener("beforeunload", this.beforeUnloadHandler);
+		// capture: fires before Obsidian's (bubble-phase) onbeforeunload, so the veto above wins.
+		window.addEventListener("beforeunload", this.beforeUnloadHandler, {
+			capture: true,
+		});
 	}
 
 	private removeBeforeUnload() {
 		if (typeof window !== "undefined" && this.beforeUnloadHandler) {
 			window.removeEventListener(
 				"beforeunload",
-				this.beforeUnloadHandler
+				this.beforeUnloadHandler,
+				{ capture: true }
 			);
 		}
 		this.beforeUnloadHandler = null;
+	}
+
+	// ── Secondary windows (pop-outs, Settings) ──────────────────────
+	// Obsidian opens every pop-out tab and the Settings window through window.open(). Wrapping
+	// it lets hide/show treat the whole vault as one unit. Restored on unload.
+	private patchWindowOpen() {
+		if (typeof window === "undefined" || this.windowOpenWrapper) return;
+		const original = window.open;
+		if (typeof original !== "function") return;
+		const opened = this.openedWindows;
+		const wrapper = function (
+			this: unknown,
+			...args: Parameters<typeof window.open>
+		): ReturnType<typeof window.open> {
+			const w = original.apply(window, args);
+			if (w) opened.add(w);
+			return w;
+		};
+		this.originalWindowOpen = original;
+		this.windowOpenWrapper = wrapper;
+		window.open = wrapper;
+	}
+
+	private unpatchWindowOpen() {
+		if (typeof window !== "undefined" && this.windowOpenWrapper) {
+			// Only put the original back if nobody wrapped window.open after us.
+			if (window.open === this.windowOpenWrapper && this.originalWindowOpen)
+				window.open = this.originalWindowOpen;
+		}
+		this.windowOpenWrapper = null;
+		this.originalWindowOpen = null;
+		this.openedWindows.clear();
+	}
+
+	// The BrowserWindow behind a DOM window: Obsidian sets `electronWindow` on each of its
+	// windows; fall back to that window's own @electron/remote.
+	private electronWindowOf(w: Window): ElectronWindow | null {
+		try {
+			const tagged = (w as unknown as { electronWindow?: ElectronWindow })
+				.electronWindow;
+			if (tagged) return tagged;
+		} catch {
+			/* cross-window access failed */
+		}
+		try {
+			const req = (w as unknown as { require?: (id: string) => unknown })
+				.require;
+			if (typeof req === "function") {
+				const r = req("@electron/remote") as ElectronRemote;
+				return r.getCurrentWindow();
+			}
+		} catch {
+			/* no remote in that window */
+		}
+		return null;
+	}
+
+	// Every live secondary window of this vault: what we saw window.open() create, plus what
+	// Obsidian already had (pop-outs restored with the layout, the Settings window) in case the
+	// plugin was enabled after they were opened. Never another vault's windows.
+	private collectSecondaryWindows(): ElectronWindow[] {
+		const doms = new Set<Window>();
+		for (const w of this.openedWindows) {
+			let closed = true;
+			try {
+				closed = w.closed;
+			} catch {
+				/* unreachable → drop it */
+			}
+			if (closed) this.openedWindows.delete(w);
+			else doms.add(w);
+		}
+		try {
+			const ws = this.app.workspace as unknown as {
+				floatingSplit?: { children?: { win?: Window }[] };
+			};
+			for (const child of ws.floatingSplit?.children ?? []) {
+				if (child?.win && !child.win.closed) doms.add(child.win);
+			}
+		} catch {
+			/* private API changed → rely on tracking */
+		}
+		try {
+			const setting = (
+				this.app as unknown as {
+					setting?: { popout?: { win?: Window } | null };
+				}
+			).setting;
+			const w = setting?.popout?.win;
+			if (w && !w.closed) doms.add(w);
+		} catch {
+			/* private API changed → rely on tracking */
+		}
+
+		let myId = -1;
+		try {
+			myId = this.win?.id ?? -1;
+		} catch {
+			/* id unreachable */
+		}
+		const out: ElectronWindow[] = [];
+		const seen = new Set<number>();
+		for (const d of doms) {
+			const bw = this.electronWindowOf(d);
+			if (!bw) continue;
+			try {
+				if (bw.isDestroyed()) continue;
+				const id = bw.id;
+				if (id === myId || seen.has(id)) continue;
+				seen.add(id);
+				out.push(bw);
+			} catch {
+				/* window gone */
+			}
+		}
+		return out;
+	}
+
+	// Hide the visible secondary windows and remember them for showWindow().
+	private hideSecondaries() {
+		for (const bw of this.collectSecondaryWindows()) {
+			try {
+				if (!bw.isVisible()) continue;
+				bw.hide();
+				this.hiddenSecondaries.push(bw);
+			} catch {
+				/* window gone */
+			}
+		}
+	}
+
+	// Bring back what hideSecondaries() hid. Without focus: the main window is focused last.
+	private restoreSecondaries() {
+		const list = this.hiddenSecondaries;
+		this.hiddenSecondaries = [];
+		for (const bw of list) {
+			try {
+				if (bw.isDestroyed()) continue;
+				if (typeof bw.showInactive === "function") bw.showInactive();
+				else bw.show();
+			} catch {
+				/* window gone */
+			}
+		}
 	}
 
 	// ── Close interception ② window.on("close") (fallback) ───────────────
@@ -254,7 +418,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.closeHandler = (e: ElectronEvent) => {
 			if (this.settings.runInBackground && !this.reallyQuitting) {
 				e.preventDefault();
-				win.hide();
+				this.hideWindow();
 				return;
 			}
 			// The window is really going away: a hidden picker left behind would keep the
@@ -580,21 +744,29 @@ export default class BackgroundTrayPlugin extends Plugin {
 		}
 	}
 
+	// Show = the main window plus every secondary window that was hidden with it.
 	showWindow() {
 		const win = this.win;
 		if (!win) return;
 		try {
 			if (win.isMinimized()) win.restore();
 			win.show();
-			win.focus();
 		} catch {
 			/* ignore restore failure */
 		}
+		this.restoreSecondaries();
+		try {
+			win.focus();
+		} catch {
+			/* ignore focus failure */
+		}
 	}
 
+	// Hide = the whole vault: pop-outs and the Settings window go to the tray with the main window.
 	hideWindow() {
 		const win = this.win;
 		if (!win) return;
+		this.hideSecondaries();
 		try {
 			win.hide();
 		} catch {
@@ -625,8 +797,21 @@ export default class BackgroundTrayPlugin extends Plugin {
 	relaunch() {
 		try {
 			this.reallyQuitting = true;
-			this.remote?.app?.relaunch();
-			this.remote?.app?.exit(0);
+			const app = this.remote?.app;
+			// app.exit() destroys the windows one by one without a before-quit. Obsidian's "closed"
+			// handler then sees other windows still alive and marks THIS vault as not open — so
+			// the relaunched Obsidian showed the vault picker instead of the vault. Two windows
+			// can still be alive at that point: a hidden vault picker (drop it first) and, with
+			// several vaults open, the other vaults (tell Obsidian a quit is under way, which is
+			// what a real before-quit would have done).
+			this.destroyHiddenPickers();
+			try {
+				app?.emit("before-quit");
+			} catch {
+				/* not reachable → single-vault relaunch still works */
+			}
+			app?.relaunch();
+			app?.exit(0);
 		} catch (e) {
 			console.error("Background Tray: relaunch failed", e);
 		}

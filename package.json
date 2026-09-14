@@ -1,6 +1,6 @@
 {
 	"name": "background-tray",
-	"version": "1.09.13",
+	"version": "1.09.14",
 	"description": "Keep running in the system tray instead of quitting when you close the window.",
 	"main": "main.js",
 	"scripts": {

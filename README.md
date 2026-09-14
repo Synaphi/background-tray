@@ -40,6 +40,11 @@ Settings → Community plugins.
 
 Close the window and Obsidian keeps running in the tray — and so does your sync. Click the tray icon to bring it back. To actually quit, right-click the tray icon and choose **Quit completely**.
 
+## What's new in 1.09.14
+
+- **Fix (#3 follow-up): pop-out windows and the Settings window now hide and come back together with the main window.** Closing the main window (X) used to make Obsidian's own quit hook close every secondary window — a tab moved to a new window, or the Settings window — so nothing but the main window came back from the tray. Hiding from the tray icon left them on screen instead. Now the whole vault goes to the tray and the whole vault comes back.
+- **Fix (#3 follow-up): Relaunch Obsidian no longer opens the vault picker instead of your vault.** If Obsidian had been reopened from the taskbar while hidden (which leaves a hidden vault-picker window behind), a Relaunch from the tray menu made Obsidian mark the vault as closed on the way out. The same happened with several vaults open (only the last one came back). Both cases are handled.
+
 ## What's new in 1.09.13
 
 - **Fix (#3):** after reopening Obsidian from the taskbar while it was hidden in the tray, **Quit completely** could leave a headless Obsidian process behind — no window, no tray icon, only Task Manager could end it. Cause: the vault picker that Obsidian opens on relaunch was kept hidden but never closed, so Obsidian never reached its "all windows closed" exit. The hidden picker is now removed whenever the window really goes away (Quit completely, closing with *Run in background* off, disabling the plugin, or turning the option off). Side effect fixed too: after such a relaunch the vault was being marked "closed" on quit, so the next launch showed the vault picker instead of your vault.

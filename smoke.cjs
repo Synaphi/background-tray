@@ -23,6 +23,7 @@ const fakeWin = {
   removeListener(ev,fn){ log.listeners[ev]=(log.listeners[ev]||[]).filter(f=>f!==fn); },
   hide(){ this._visible=false; log.hidden++; },
   show(){ this._visible=true; log.shown++; },
+  showInactive(){ this._visible=true; log.shownInactive=(log.shownInactive||0)+1; },
   focus(){ log.focused++; },
   isVisible(){ return this._visible; }, isMinimized(){ return this._min; }, restore(){ this._min=false; },
   close(){ log.quit++; log.closeSeq.push("win.close"); }, setSkipTaskbar(){}, isDestroyed(){ return false; }, id:1,
@@ -33,7 +34,8 @@ const nativeImage = { createFromPath(){ return {isEmpty(){return true;}}; }, cre
 // Registry of app (main-process) events — used to exercise the single-instance relaunch path.
 const appEvents = {};
 const remoteStub = { getCurrentWindow(){ return fakeWin; }, Tray, Menu, nativeImage, app:{
-  quit(){log.quit++; log.appQuit++;}, relaunch(){}, exit(){}, dock:{show(){}},
+  quit(){log.quit++; log.appQuit++;}, relaunch(){ log.closeSeq.push("app.relaunch"); }, exit(){ log.closeSeq.push("app.exit"); }, dock:{show(){}},
+  emit(ev){ log.closeSeq.push("emit:"+ev); return true; },
   async getFileIcon(){ return {isEmpty(){return true;}}; },
   prependListener(ev,fn){ (appEvents[ev]=appEvents[ev]||[]).unshift(fn); },
   on(ev,fn){ (appEvents[ev]=appEvents[ev]||[]).push(fn); },
@@ -49,18 +51,25 @@ Module._load = function(req, parent, isMain){
 };
 
 // ── global window stub ── mimics the renderer window.require / beforeunload / setTimeout.
-const _winListeners = {};
+const _winListeners = {}; const _winCapture = new Map();
+// Secondary windows (pop-outs / the Settings window) are DOM windows from window.open, each tagged
+// with its BrowserWindow the way Obsidian does (window.electronWindow).
+const mkSecondary=(id)=>({ closed:false, electronWindow:{ id, _visible:true, hidden:0, shown:0, shownInactive:0, destroyed:false,
+  hide(){ this._visible=false; this.hidden++; }, show(){ this._visible=true; this.shown++; }, showInactive(){ this._visible=true; this.shownInactive++; },
+  isVisible(){ return this._visible; }, isDestroyed(){ return this.destroyed; } } });
+const _origOpen = function(){ _origOpen.count=(_origOpen.count||0)+1; return mkSecondary(100+_origOpen.count); };
 global.window = {
   require,
-  addEventListener(ev, fn){ (_winListeners[ev]=_winListeners[ev]||[]).push(fn); },
+  addEventListener(ev, fn, opts){ (_winListeners[ev]=_winListeners[ev]||[]).push(fn); _winCapture.set(fn, !!(opts&&opts.capture)); },
   removeEventListener(ev, fn){ _winListeners[ev]=(_winListeners[ev]||[]).filter(f=>f!==fn); },
   setTimeout: (fn, t) => setTimeout(fn, t),
+  open: _origOpen,
 };
 
 global.document = { title: "Some note - TitleVault - Obsidian v1.12.0" };
 
 const PluginClass = require("./main.js").default || require("./main.js");
-const mkApp = (vault) => ({ vault, workspace:{ onLayoutReady(cb){ cb(); } } });
+const mkApp = (vault) => ({ vault, workspace:{ onLayoutReady(cb){ cb(); }, floatingSplit:{ children:[] } }, setting:{ popout:null } });
 const app = mkApp({ getName(){ return "TestVault"; }, adapter:{ getBasePath(){ return "C:\\Obsidian\\TestVault"; } } });
 const p = new PluginClass(app, { id:"background-tray" });
 
@@ -169,6 +178,53 @@ const p = new PluginClass(app, { id:"background-tray" });
   p4.settings.focusOnRelaunch=false; p4.destroyHiddenPickers();
   ok(picker4.destroyed===1, "focusOnRelaunch OFF: the hidden vault picker is destroyed");
   p4.onunload();
+
+  // ── issue #3 follow-up (a): pop-outs and the Settings window hide and come back with the main window ──
+  //   Obsidian's own onbeforeunload treats a close of the main window as a quit and CLOSES every pop-out;
+  //   the plugin must veto first (capture) and stop that hook, then hide the whole vault.
+  const appS = mkApp({ getName(){ return "TestVault"; }, adapter:{ getBasePath(){ return "C:\\Obsidian\\TestVault"; } } });
+  const p5 = new PluginClass(appS, {id:"background-tray"}); await p5.onload();
+  const bu=(_winListeners["beforeunload"]||[]);
+  ok(bu.length===1 && _winCapture.get(bu[0])===true, "beforeunload listener registered in the capture phase (runs before Obsidian's quit hook)");
+  ok(global.window.open!==_origOpen, "window.open is wrapped to learn about pop-out / Settings windows");
+  const popA = global.window.open("about:blank","_blank","popup");          // e.g. the Settings window
+  const popB = global.window.open("about:blank","_blank","popup");          // e.g. Move to new window
+  const popLayout = mkSecondary(300); appS.workspace.floatingSplit.children.push({ win: popLayout }); // pop-out restored with the layout, never seen by window.open
+  const popHiddenAlready = global.window.open("about:blank","_blank","popup"); popHiddenAlready.electronWindow._visible=false;
+  const closedPop = global.window.open("about:blank","_blank","popup"); closedPop.closed=true;
+  fakeWin._visible=true; const hiddenB=log.hidden, shownB=log.shown, focusedB=log.focused;
+  let prevented5=false, stopped5=false;
+  bu.forEach(fn=>fn({ preventDefault(){prevented5=true;}, stopImmediatePropagation(){stopped5=true;} }));
+  ok(prevented5===true && stopped5===true, "X while running in background: close vetoed AND Obsidian's quit hook stopped (pop-outs are not closed)");
+  ok(log.hidden===hiddenB+1 && fakeWin._visible===false, "X: main window hidden");
+  ok(popA.electronWindow.hidden===1 && popB.electronWindow.hidden===1 && popLayout.electronWindow.hidden===1, "X: every visible secondary window is hidden with it (window.open-tracked and layout pop-outs)");
+  ok(popHiddenAlready.electronWindow.hidden===0, "a secondary window that was already hidden is left alone");
+  p5.showWindow();
+  ok(log.shown===shownB+1 && log.focused===focusedB+1, "show: main window shown and focused");
+  ok(popA.electronWindow.shownInactive===1 && popB.electronWindow.shownInactive===1 && popLayout.electronWindow.shownInactive===1, "show: the hidden secondary windows come back (without stealing focus)");
+  ok(popHiddenAlready.electronWindow.shownInactive===0 && popHiddenAlready.electronWindow.shown===0, "show: a window we did not hide is not shown");
+  // hide via tray / command → same treatment, and a window closed meanwhile is skipped
+  p5.hideWindow(); popB.electronWindow.destroyed=true; p5.showWindow();
+  ok(popA.electronWindow.hidden===2 && popA.electronWindow.shownInactive===2 && popB.electronWindow.shownInactive===1, "tray hide/show: same for secondaries; a window destroyed while hidden is skipped");
+  // a real quit must NOT stop Obsidian's quit hook (it saves the layout and closes pop-outs itself)
+  p5.reallyQuitting=true; let stopped5b=false, prevented5b=false;
+  bu.forEach(fn=>fn({ preventDefault(){prevented5b=true;}, stopImmediatePropagation(){stopped5b=true;} }));
+  ok(prevented5b===false && stopped5b===false, "real quit: beforeunload passes through untouched");
+  p5.reallyQuitting=false; p5.hideWindow();
+  p5.onunload();
+  ok(global.window.open===_origOpen, "onunload: window.open restored");
+  ok(popA.electronWindow.shownInactive===3, "onunload: secondary windows hidden by the plugin are shown again (nothing stays invisible)");
+
+  // ── issue #3 follow-up (b): Relaunch with a hidden vault picker (or several vaults) around ──
+  //   app.exit() fires "closed" per window without a before-quit; Obsidian's handler then marks the vault
+  //   as not open when another window still exists → the relaunched Obsidian showed the vault picker.
+  const p6 = new PluginClass(app, {id:"background-tray"}); await p6.onload();
+  remoteStub.app._emit("second-instance");
+  const picker6=mkPicker(6); picker6.destroy=function(){ this.destroyed++; log.closeSeq.push("picker.destroy"); };
+  remoteStub.app._emit("browser-window-created", {preventDefault(){}}, picker6);
+  log.closeSeq=[]; p6.relaunch();
+  ok(log.closeSeq.join(">")==="picker.destroy>emit:before-quit>app.relaunch>app.exit", "relaunch: destroy hidden picker → before-quit → relaunch → exit (order verified)");
+  p6.onunload();
   console.log(fail===0 ? "\nALL PASS" : `\n${fail} FAIL`);
   process.exit(fail===0?0:1);
 })();
