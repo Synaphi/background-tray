@@ -1,4 +1,5 @@
 import { App, Notice, Plugin, PluginSettingTab, Setting } from "obsidian";
+import { resolve } from "node:path";
 
 /*
  * Background Tray — keep Obsidian running in the system tray instead of quitting.
@@ -75,6 +76,7 @@ interface ElectronApp {
 
 interface ElectronRemote {
 	app: ElectronApp;
+	BrowserWindow?: { getAllWindows(): ElectronWindow[] };
 	getCurrentWindow(): ElectronWindow;
 	Tray: new (icon: NativeImageLike) => ElectronTray;
 	Menu: { buildFromTemplate(template: MenuItemTemplate[]): unknown };
@@ -130,6 +132,8 @@ export default class BackgroundTrayPlugin extends Plugin {
 	private remote: ElectronRemote | null = null;
 	private win: ElectronWindow | null = null;
 	private tray: ElectronTray | null = null;
+	private trayGeneration = 0;
+	private closeRecoveryTimer: ReturnType<typeof setTimeout> | null = null;
 	private closeHandler: ((e: ElectronEvent) => void) | null = null;
 	private beforeUnloadHandler: ((e: BeforeUnloadEvent) => void) | null = null;
 	private secondInstanceHandler: (() => void) | null = null;
@@ -207,6 +211,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 	}
 
 	onunload() {
+		if (this.closeRecoveryTimer) clearTimeout(this.closeRecoveryTimer);
 		// Cleanup checklist from 01. Spec §3.4 — turning the plugin off restores everything.
 		this.removeBeforeUnload();
 		this.removeCloseInterception();
@@ -589,9 +594,11 @@ export default class BackgroundTrayPlugin extends Plugin {
 		const remote = this.remote;
 		if (!remote) return;
 		this.destroyTray(); // guard against duplicates
+		const generation = this.trayGeneration;
 		try {
 			const { Tray, Menu } = remote;
 			const icon = await this.resolveTrayIcon(remote);
+			if (generation !== this.trayGeneration) return;
 
 			const tray = new Tray(icon);
 			this.tray = tray;
@@ -620,7 +627,20 @@ export default class BackgroundTrayPlugin extends Plugin {
 				/* invalid path → next candidate */
 			}
 		}
-		// 2) extract the icon from the Obsidian executable at runtime (nothing to bundle)
+		// 2) On macOS, the executable itself has a generic "exec" file icon.
+		// Ask Finder for the enclosing .app bundle icon instead.
+		if (process.platform === "darwin") {
+			const bundlePath = resolve(process.execPath, "../../..");
+			if (bundlePath.endsWith(".app")) {
+				try {
+					const img = await app.getFileIcon(bundlePath, { size: "normal" });
+					if (!img.isEmpty()) return img;
+				} catch {
+					/* bundle unavailable → next candidate */
+				}
+			}
+		}
+		// 3) other platforms, or a macOS bundle lookup failure.
 		try {
 			const img = await app.getFileIcon(process.execPath, {
 				size: "normal",
@@ -629,11 +649,12 @@ export default class BackgroundTrayPlugin extends Plugin {
 		} catch {
 			/* extraction failed → fallback */
 		}
-		// 3) last-resort fallback
+		// 4) last-resort fallback
 		return nativeImage.createFromDataURL(DEFAULT_TRAY_ICON);
 	}
 
 	private destroyTray() {
+		this.trayGeneration++;
 		if (this.tray) {
 			try {
 				this.tray.destroy();
@@ -735,7 +756,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 		if (!win) return;
 		try {
 			if (win.isVisible() && !win.isMinimized()) {
-				win.hide();
+				this.hideWindow();
 			} else {
 				this.showWindow();
 			}
@@ -774,16 +795,50 @@ export default class BackgroundTrayPlugin extends Plugin {
 		}
 	}
 
+	private isLastVaultWindow(): boolean {
+		const remote = this.remote;
+		const win = this.win;
+		if (!remote?.BrowserWindow || !win) return false;
+		try {
+			const mine = new Set([
+				win.id,
+				...this.collectSecondaryWindows().map((w) => w.id),
+				...this.hiddenPickers.map((w) => w.id),
+			]);
+			const live = remote.BrowserWindow.getAllWindows().filter(
+				(w) => !w.isDestroyed()
+			);
+			return live.some((w) => w.id === win.id) && live.every((w) => mine.has(w.id));
+		} catch {
+			// Uncertain ownership: close only this vault, never another vault.
+			return false;
+		}
+	}
+
 	quitCompletely() {
 		this.reallyQuitting = true;
-		// Drop the hidden vault picker first: Obsidian only exits on window-all-closed, so a picker
-		// left behind kept the process alive with no window and no tray (issue #3). Then close just
-		// our window — not app.quit(): with several vaults open, quitting from one tray icon must
-		// not pull the other vaults down (their plugin instances would veto and hide instead).
+		if (this.closeRecoveryTimer) clearTimeout(this.closeRecoveryTimer);
+		this.destroyTray();
+		// Drop a hidden vault picker before closing. With other vaults open, close only this
+		// vault; with no other windows, quit the macOS app itself rather than leaving it alive
+		// without a window or tray.
 		this.destroyHiddenPickers();
 		try {
-			if (this.win) this.win.close();
-			else this.remote?.app?.quit();
+			if (this.win) {
+				const win = this.win;
+				// macOS can keep an app alive with no windows. If this is the final vault,
+				// quit the app itself; otherwise close only this vault's window.
+				if (this.isLastVaultWindow()) this.remote?.app.quit();
+				else win.close();
+				// Close can be vetoed by another plugin or beforeunload. Give an accepted
+				// close time to finish before restoring a tray for a still-open vault.
+				if (!win.isDestroyed()) this.closeRecoveryTimer = setTimeout(() => {
+					this.closeRecoveryTimer = null;
+					if (win.isDestroyed()) return;
+					this.reallyQuitting = false;
+					if (this.settings.createTrayIcon) void this.createTray();
+				}, 5000);
+			} else this.remote?.app?.quit();
 		} catch (e) {
 			console.error("Background Tray: quit failed", e);
 			try {

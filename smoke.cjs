@@ -16,7 +16,7 @@ let notices=[]; class Notice { constructor(m){ notices.push(m); } }
 const obsidianStub = { Plugin, PluginSettingTab, Setting, Notice, App: class {} };
 
 // ── @electron/remote stub ──
-const log = { listeners:{}, hidden:0, shown:0, focused:0, trayCreated:0, trayDestroyed:0, prevented:0, quit:0, appQuit:0, closeSeq:[] };
+const log = { listeners:{}, hidden:0, shown:0, focused:0, trayCreated:0, trayDestroyed:0, prevented:0, quit:0, appQuit:0, closeSeq:[], iconPaths:[], cancelClose:false, closeAttempted:false };
 const fakeWin = {
   _visible:true, _min:false,
   on(ev,fn){ (log.listeners[ev]=log.listeners[ev]||[]).push(fn); },
@@ -26,17 +26,21 @@ const fakeWin = {
   showInactive(){ this._visible=true; log.shownInactive=(log.shownInactive||0)+1; },
   focus(){ log.focused++; },
   isVisible(){ return this._visible; }, isMinimized(){ return this._min; }, restore(){ this._min=false; },
-  close(){ log.quit++; log.closeSeq.push("win.close"); }, setSkipTaskbar(){}, isDestroyed(){ return false; }, id:1,
+  close(){ log.quit++; log.closeAttempted=true; log.closeSeq.push("win.close"); }, setSkipTaskbar(){}, isDestroyed(){ return log.closeAttempted&&!log.cancelClose; }, id:1,
 };
-class Tray { constructor(i){ this.icon=i; log.trayCreated++; } setToolTip(t){ log.tooltip=t; } setContextMenu(){} on(){} destroy(){ log.trayDestroyed++; } }
+class Tray { constructor(i){ this.icon=i; log.trayCreated++; } setToolTip(t){ log.tooltip=t; } setContextMenu(){} on(){} destroy(){ log.trayDestroyed++; log.closeSeq.push("tray.destroy"); } }
 const Menu = { buildFromTemplate(t){ log.menuTemplate=t; return {_t:t}; } };
 const nativeImage = { createFromPath(){ return {isEmpty(){return true;}}; }, createFromDataURL(){ return {isEmpty(){return false;}}; }, createEmpty(){ return {}; } };
+const emptyFileIcon = {isEmpty(){return true;}};
+let fileIconFactory = () => emptyFileIcon;
+let otherVaultPresent = true;
 // Registry of app (main-process) events — used to exercise the single-instance relaunch path.
 const appEvents = {};
-const remoteStub = { getCurrentWindow(){ return fakeWin; }, Tray, Menu, nativeImage, app:{
-  quit(){log.quit++; log.appQuit++;}, relaunch(){ log.closeSeq.push("app.relaunch"); }, exit(){ log.closeSeq.push("app.exit"); }, dock:{show(){}},
+const remoteStub = { getCurrentWindow(){ return fakeWin; }, Tray, Menu, nativeImage,
+  BrowserWindow:{getAllWindows(){return otherVaultPresent ? [fakeWin,{id:99,isDestroyed(){return false;}}] : [fakeWin];}}, app:{
+  quit(){log.quit++; log.appQuit++; this._emit("before-quit");}, relaunch(){ log.closeSeq.push("app.relaunch"); }, exit(){ log.closeSeq.push("app.exit"); }, dock:{show(){}},
   emit(ev){ log.closeSeq.push("emit:"+ev); return true; },
-  async getFileIcon(){ return {isEmpty(){return true;}}; },
+  async getFileIcon(path){ log.iconPaths.push(path); return fileIconFactory(path); },
   prependListener(ev,fn){ (appEvents[ev]=appEvents[ev]||[]).unshift(fn); },
   on(ev,fn){ (appEvents[ev]=appEvents[ev]||[]).push(fn); },
   removeListener(ev,fn){ appEvents[ev]=(appEvents[ev]||[]).filter(f=>f!==fn); },
@@ -75,7 +79,14 @@ const p = new PluginClass(app, { id:"background-tray" });
 
 (async () => {
   let fail=0; const ok=(c,m)=>{ console.log((c?"  PASS":"  FAIL")+" — "+m); if(!c)fail++; };
-  await p.onload();
+  const originalExecPath=process.execPath;
+  const bundleIcon={isEmpty(){return false;}};
+  if(process.platform==="darwin") {
+    process.execPath="/Applications/Obsidian.app/Contents/MacOS/Obsidian";
+    fileIconFactory=path=>path.endsWith(".app")?bundleIcon:emptyFileIcon;
+  }
+  try { await p.onload(); } finally { process.execPath=originalExecPath; fileIconFactory=()=>emptyFileIcon; }
+  if(process.platform==="darwin") ok(log.iconPaths.length===1 && log.iconPaths[0]==="/Applications/Obsidian.app" && p.tray.icon===bundleIcon, "macOS: the tray uses the bundle icon without falling back to the executable");
   ok(log.trayCreated===1, "creates exactly one tray");
   ok((log.listeners["close"]||[]).length===1, "registers exactly one close listener");
   ok(p._commands.length===3, "registers 3 commands (show/hide/toggle)");
@@ -150,12 +161,46 @@ const p = new PluginClass(app, { id:"background-tray" });
   const appQuitBefore=log.appQuit; log.closeSeq=[];
   picker2.destroy=function(){ this.destroyed++; log.closeSeq.push("picker.destroy"); };
   p2.quitCompletely();
-  ok(log.closeSeq.join(">")==="picker.destroy>win.close", "quitCompletely: destroys the hidden vault picker, THEN closes our window (order verified)");
+  ok(log.closeSeq.join(">")==="tray.destroy>picker.destroy>win.close", "quitCompletely: removes the native icon and hidden picker BEFORE closing the vault window");
   ok(log.appQuit===appQuitBefore, "quitCompletely: closes only this vault's window — never app.quit() (other open vaults keep running)");
   // Bypass check: while reallyQuitting, a close event must not be preventDefault-ed
   let prevented2=false; (log.listeners["close"]||[]).forEach(fn=>fn({preventDefault(){prevented2=true;}}));
   ok(prevented2===false, "close interception is bypassed while reallyQuitting");
   p2.onunload();
+
+  log.closeAttempted=false; otherVaultPresent=false;
+  const pLast = new PluginClass(app, {id:"background-tray"}); await pLast.onload();
+  const appQuitBeforeLast=log.appQuit;
+  pLast.quitCompletely();
+  ok(log.appQuit===appQuitBeforeLast+1 && pLast.tray===null, "last vault Quit completely exits the macOS app, rather than leaving a trayless process");
+  pLast.onunload(); otherVaultPresent=true;
+
+  const originalGetAllWindows=remoteStub.BrowserWindow.getAllWindows;
+  const secondary={id:42,isDestroyed(){return false;}};
+  remoteStub.BrowserWindow.getAllWindows=()=>[fakeWin,secondary];
+  const pSecondary = new PluginClass(app, {id:"background-tray"}); await pSecondary.onload();
+  pSecondary.collectSecondaryWindows=()=>[secondary];
+  const appQuitBeforeSecondary=log.appQuit;
+  pSecondary.quitCompletely();
+  ok(log.appQuit===appQuitBeforeSecondary+1, "last vault with a known Settings/pop-out window exits the app");
+  pSecondary.onunload();
+  remoteStub.BrowserWindow.getAllWindows=()=>[fakeWin,{id:44,isDestroyed(){return false;}}];
+  const pUnknown = new PluginClass(app, {id:"background-tray"}); await pUnknown.onload();
+  pUnknown.collectSecondaryWindows=()=>[];
+  const appQuitBeforeUnknown=log.appQuit;
+  pUnknown.quitCompletely();
+  ok(log.appQuit===appQuitBeforeUnknown, "an unrecognized window never causes app-wide Quit");
+  pUnknown.onunload();
+  remoteStub.BrowserWindow.getAllWindows=originalGetAllWindows;
+
+  const pCancelled = new PluginClass(app, {id:"background-tray"}); await pCancelled.onload();
+  log.cancelClose=true;
+  pCancelled.quitCompletely();
+  ok(pCancelled.reallyQuitting===true && pCancelled.tray===null, "cancelled Quit does not immediately restore the tray during a pending close");
+  await new Promise(resolve=>setTimeout(resolve,5100));
+  ok(pCancelled.reallyQuitting===false && pCancelled.tray!==null, "cancelled Quit completely restores the tray and normal background behavior");
+  log.cancelClose=false;
+  pCancelled.onunload();
 
   // ── issue #3 (b): a real close with "Run in background" OFF also takes the hidden picker along ──
   const p3 = new PluginClass(app, {id:"background-tray"}); await p3.onload();
@@ -168,6 +213,21 @@ const p = new PluginClass(app, { id:"background-tray" });
   ok(prevented3===false && log.hidden===hiddenBefore3, "run-in-background OFF: close is not intercepted");
   ok(picker3.destroyed===1, "run-in-background OFF: the hidden vault picker is destroyed on the real close");
   p3.onunload();
+
+  // A late icon lookup must not resurrect a tray after this vault closes.
+  let lookupStarted; const started=new Promise(resolve=>{lookupStarted=resolve;});
+  let finishLookup;
+  fileIconFactory=()=>{lookupStarted();return new Promise(resolve=>{finishLookup=resolve;});};
+  const pRace = new PluginClass(app, {id:"background-tray"});
+  const loading=pRace.onload();
+  await started;
+  const createdBeforeRace=log.trayCreated;
+  pRace.quitCompletely();
+  finishLookup({isEmpty(){return false;}});
+  await loading;
+  ok(pRace.tray===null && log.trayCreated===createdBeforeRace, "late icon lookup cannot recreate a tray after Quit completely");
+  fileIconFactory=()=>emptyFileIcon;
+  pRace.onunload();
 
   // ── issue #3 (c): turning "Focus existing window on relaunch" off releases the hidden picker ──
   const p4 = new PluginClass(app, {id:"background-tray"}); await p4.onload();
@@ -203,9 +263,14 @@ const p = new PluginClass(app, { id:"background-tray" });
   ok(log.shown===shownB+1 && log.focused===focusedB+1, "show: main window shown and focused");
   ok(popA.electronWindow.shownInactive===1 && popB.electronWindow.shownInactive===1 && popLayout.electronWindow.shownInactive===1, "show: the hidden secondary windows come back (without stealing focus)");
   ok(popHiddenAlready.electronWindow.shownInactive===0 && popHiddenAlready.electronWindow.shown===0, "show: a window we did not hide is not shown");
+  // The tray click and Show / Hide menu use toggleWindow, not hideWindow directly.
+  p5.toggleWindow();
+  ok(fakeWin._visible===false && popA.electronWindow.hidden===2 && popB.electronWindow.hidden===2 && popLayout.electronWindow.hidden===2, "tray toggle hides the main window, Settings, and pop-outs together");
+  p5.toggleWindow();
+  ok(fakeWin._visible===true && popA.electronWindow.shownInactive===2 && popB.electronWindow.shownInactive===2 && popLayout.electronWindow.shownInactive===2, "tray toggle restores the main window, Settings, and pop-outs together");
   // hide via tray / command → same treatment, and a window closed meanwhile is skipped
   p5.hideWindow(); popB.electronWindow.destroyed=true; p5.showWindow();
-  ok(popA.electronWindow.hidden===2 && popA.electronWindow.shownInactive===2 && popB.electronWindow.shownInactive===1, "tray hide/show: same for secondaries; a window destroyed while hidden is skipped");
+  ok(popA.electronWindow.hidden===3 && popA.electronWindow.shownInactive===3 && popB.electronWindow.shownInactive===2, "tray hide/show: same for secondaries; a window destroyed while hidden is skipped");
   // a real quit must NOT stop Obsidian's quit hook (it saves the layout and closes pop-outs itself)
   p5.reallyQuitting=true; let stopped5b=false, prevented5b=false;
   bu.forEach(fn=>fn({ preventDefault(){prevented5b=true;}, stopImmediatePropagation(){stopped5b=true;} }));
@@ -213,7 +278,7 @@ const p = new PluginClass(app, { id:"background-tray" });
   p5.reallyQuitting=false; p5.hideWindow();
   p5.onunload();
   ok(global.window.open===_origOpen, "onunload: window.open restored");
-  ok(popA.electronWindow.shownInactive===3, "onunload: secondary windows hidden by the plugin are shown again (nothing stays invisible)");
+  ok(popA.electronWindow.shownInactive===4, "onunload: secondary windows hidden by the plugin are shown again (nothing stays invisible)");
 
   // ── issue #3 follow-up (b): Relaunch with a hidden vault picker (or several vaults) around ──
   //   app.exit() fires "closed" per window without a before-quit; Obsidian's handler then marks the vault
