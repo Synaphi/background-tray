@@ -37,9 +37,11 @@ interface ElectronWindow {
 	isDestroyed(): boolean;
 	isResizable(): boolean;
 	setSkipTaskbar(skip: boolean): void;
+	isFocusable?(): boolean;
+	setFocusable?(focusable: boolean): void;
 	on(event: "close", listener: (e: ElectronEvent) => void): void;
 	on(event: "ready-to-show" | "show", listener: () => void): void;
-	removeListener(event: "close", listener: ElectronListener): void;
+	removeListener(event: string, listener: ElectronListener): void;
 }
 
 interface ElectronTray {
@@ -78,6 +80,8 @@ interface ElectronRemote {
 	app: ElectronApp;
 	BrowserWindow?: { getAllWindows(): ElectronWindow[] };
 	getCurrentWindow(): ElectronWindow;
+	// The main-process object — used to read the launch arguments (start-hidden flag).
+	process?: { argv: string[] };
 	Tray: new (icon: NativeImageLike) => ElectronTray;
 	Menu: { buildFromTemplate(template: MenuItemTemplate[]): unknown };
 	nativeImage: {
@@ -90,6 +94,10 @@ interface BackgroundTraySettings {
 	runInBackground: boolean;
 	createTrayIcon: boolean;
 	focusOnRelaunch: boolean;
+	// Launch hidden when Obsidian was started with --hidden (or a custom flag). Lets an
+	// autostart entry boot Obsidian straight into the tray with no window flash.
+	startHidden: boolean;
+	startHiddenFlag: string;
 	trayIconPath: string;
 	trayTooltip: string;
 }
@@ -98,6 +106,8 @@ const DEFAULT_SETTINGS: BackgroundTraySettings = {
 	runInBackground: true,
 	createTrayIcon: true,
 	focusOnRelaunch: true,
+	startHidden: true,
+	startHiddenFlag: "--hidden",
 	trayIconPath: "",
 	trayTooltip: "{{vault}} — Obsidian",
 };
@@ -153,6 +163,14 @@ export default class BackgroundTrayPlugin extends Plugin {
 	private openedWindows = new Set<Window>();
 	private originalWindowOpen: typeof window.open | null = null;
 	private windowOpenWrapper: typeof window.open | null = null;
+	// Start-hidden: set while Obsidian was launched with the flag and the window has not been
+	// asked for yet. Guards against the compositor/Electron showing the window again.
+	private startHiddenPending = false;
+	private startHiddenShowGuard: (() => void) | null = null;
+	// Original win.show / win.showInactive while start-hidden is in force (restored on release).
+	private startHiddenRestoreShow: (() => void) | null = null;
+	// Focusable state to put back when the window is first shown (undefined = untouched).
+	private startHiddenWasFocusable: boolean | undefined = undefined;
 
 	async onload() {
 		await this.loadSettings();
@@ -174,6 +192,13 @@ export default class BackgroundTrayPlugin extends Plugin {
 			this.win = null;
 		}
 
+		// ★ Start hidden: swallow the show requests Electron makes while the window is still
+		// coming up, BEFORE the first await below. Doing it here (synchronously, right after we
+		// have the window) is what removes the visible flash — a hide() after an await lands a
+		// frame too late and the window is already on screen.
+		const startHidden = this.settings.createTrayIcon && this.isStartHiddenRequested();
+		if (startHidden) this.applyStartHidden();
+
 		// ★ Closing is intercepted at two layers:
 		//   (1) beforeunload (a renderer event) — the primary veto, reliable on Electron 39.
 		//   (2) window.on("close") (remote) — a fallback. On Electron 39 with @electron/remote
@@ -186,6 +211,10 @@ export default class BackgroundTrayPlugin extends Plugin {
 		this.patchWindowOpen();
 
 		if (this.settings.createTrayIcon) await this.createTray();
+
+		// Start hidden was applied above; if the tray icon could not be created there is no way
+		// back, so give the window back instead of leaving an invisible process.
+		if (startHidden && !this.tray) this.releaseStartHiddenGuard();
 
 		// In some environments app.vault.getName() is still empty during onload → resolve the vault
 		// name again once the layout is ready and re-apply the tray labels.
@@ -212,6 +241,8 @@ export default class BackgroundTrayPlugin extends Plugin {
 
 	onunload() {
 		if (this.closeRecoveryTimer) clearTimeout(this.closeRecoveryTimer);
+		// Stop forcing the window hidden, or disabling the plugin would leave it invisible.
+		this.releaseStartHiddenGuard();
 		// Cleanup checklist from 01. Spec §3.4 — turning the plugin off restores everything.
 		this.removeBeforeUnload();
 		this.removeCloseInterception();
@@ -751,6 +782,159 @@ export default class BackgroundTrayPlugin extends Plugin {
 	}
 
 	// ── Window actions ───────────────────────────────
+	// ── Start hidden ─────────────────────────────────
+	// Launched with the flag (e.g. --hidden from an autostart entry)? Then boot into the tray.
+	private isStartHiddenRequested(): boolean {
+		if (!this.settings.startHidden) return false;
+		const flag = (this.settings.startHiddenFlag || "--hidden").trim();
+		if (!flag) return false;
+		let argv: string[] = [];
+		try {
+			argv = this.remote?.process?.argv ?? [];
+		} catch {
+			/* process unreachable → no flag, behave normally */
+		}
+		// Fallback for builds where the main-process process object is not exposed.
+		if (argv.length === 0) {
+			try {
+				argv = (window as unknown as { require?: (id: string) => unknown })
+					.require?.("node:process") as unknown as string[];
+			} catch {
+				/* no node integration in the renderer */
+			}
+		}
+		if (!Array.isArray(argv)) return false;
+		return argv.includes(flag);
+	}
+
+	// Hide the window as early as possible and keep it hidden until the user asks for it
+	// (tray click, command, second launch). On most platforms Electron has already shown the
+	// window by the time a renderer plugin loads, so the first hide() can land one frame late;
+	// the guards below catch every later show/ready-to-show so it stays down.
+	private applyStartHidden() {
+		const win = this.win;
+		if (!win) return;
+		this.startHiddenPending = true;
+
+		const hide = () => {
+			if (!this.startHiddenPending) return;
+			try {
+				if (!this.win || this.win.isDestroyed()) return;
+				// Unconditional: isVisible() can still report false while Electron has already
+				// queued the map, and skipping the hide there is what let the window appear.
+				this.win.hide();
+			} catch {
+				/* ignore hide failure */
+			}
+		};
+
+		hide();
+		// Also drop it from the taskbar so a frame that slips through does not look like a real
+		// window, and make it unfocusable so the compositor cannot steal focus while Electron
+		// finishes setting the window up. Both restored by releaseStartHiddenGuard().
+		try {
+			win.setSkipTaskbar(true);
+		} catch {
+			/* unsupported on some platforms */
+		}
+		try {
+			this.startHiddenWasFocusable = win.isFocusable?.() ?? true;
+			win.setFocusable?.(false);
+		} catch {
+			/* unsupported on some platforms */
+		}
+
+		// ★ The reliable half: Electron/Obsidian call show() on their own schedule while the
+		// window is being set up, and a hide() races them. Swallow those calls instead for as
+		// long as start-hidden is in force; showWindow() puts the real methods back.
+		this.startHiddenRestoreShow = this.suppressShowCalls(win);
+
+		this.startHiddenShowGuard = hide;
+		try {
+			win.on("ready-to-show", this.startHiddenShowGuard);
+			win.on("show", this.startHiddenShowGuard);
+		} catch (e) {
+			console.error("Background Tray: failed to guard the start-hidden window", e);
+			this.startHiddenShowGuard = null;
+		}
+		// A slow machine can paint well after onload; stop guarding and let it be visible.
+		window.setTimeout(() => this.releaseStartHiddenGuard(), 10000);
+	}
+
+	// Replace win.show / win.showInactive with no-ops while start-hidden is in force.
+	// Returns a function that puts the originals back. Every Electron call is wrapped: a
+	// failure here must never leave the window unreachable.
+	private suppressShowCalls(win: ElectronWindow): (() => void) | null {
+		const target = win as unknown as {
+			show?: () => void;
+			showInactive?: () => void;
+		};
+		const originalShow = target.show;
+		const originalShowInactive = target.showInactive;
+		if (typeof originalShow !== "function") return null;
+
+		const recover = () => {
+			try {
+				target.show = originalShow;
+				if (typeof originalShowInactive === "function")
+					target.showInactive = originalShowInactive;
+			} catch {
+				/* freeze/readonly → nothing else we can do */
+			}
+		};
+
+		try {
+			target.show = () => {
+				/* swallowed: launched hidden */
+			};
+			target.showInactive = () => {
+				/* swallowed: launched hidden */
+			};
+		} catch (e) {
+			console.error("Background Tray: could not suppress window show()", e);
+			return null;
+		}
+		return recover;
+	}
+
+	// The user asked for the window (or the grace period expired): stop forcing it hidden.
+	private releaseStartHiddenGuard() {
+		this.startHiddenPending = false;
+		// Give the real show()/showInactive() back BEFORE anything tries to show the window.
+		const restore = this.startHiddenRestoreShow;
+		this.startHiddenRestoreShow = null;
+		if (restore) restore();
+		try {
+			this.win?.setSkipTaskbar(false);
+		} catch {
+			/* unsupported on some platforms */
+		}
+		if (this.startHiddenWasFocusable !== undefined) {
+			try {
+				this.win?.setFocusable?.(this.startHiddenWasFocusable);
+			} catch {
+				/* unsupported on some platforms */
+			}
+			this.startHiddenWasFocusable = undefined;
+		}
+		const guard = this.startHiddenShowGuard;
+		if (!guard) return;
+		try {
+			this.win?.removeListener("show", guard as unknown as ElectronListener);
+		} catch {
+			/* already gone */
+		}
+		try {
+			this.win?.removeListener(
+				"ready-to-show",
+				guard as unknown as ElectronListener
+			);
+		} catch {
+			/* already gone */
+		}
+		this.startHiddenShowGuard = null;
+	}
+
 	toggleWindow() {
 		const win = this.win;
 		if (!win) return;
@@ -769,6 +953,7 @@ export default class BackgroundTrayPlugin extends Plugin {
 	showWindow() {
 		const win = this.win;
 		if (!win) return;
+		this.releaseStartHiddenGuard();
 		try {
 			if (win.isMinimized()) win.restore();
 			win.show();
@@ -935,6 +1120,39 @@ class BackgroundTraySettingTab extends PluginSettingTab {
 						await this.plugin.refreshTray();
 					})
 			);
+
+		new Setting(containerEl)
+			.setName("Start hidden in the tray")
+			.setDesc(
+				"No window, no focus steal: when Obsidian is launched with the flag below, it boots straight into the tray. Start Obsidian normally (no flag) and the window opens as usual."
+			)
+			.addToggle((t) =>
+				t
+					.setValue(this.plugin.settings.startHidden)
+					.onChange(async (v) => {
+						this.plugin.settings.startHidden = v;
+						await this.plugin.saveSettings();
+						this.display(); // the flag field is only meaningful while this is on
+					})
+			);
+
+		if (this.plugin.settings.startHidden) {
+			new Setting(containerEl)
+				.setName("Start-hidden launch flag")
+				.setDesc(
+					`Command-line flag that requests a tray start (default ${DEFAULT_SETTINGS.startHiddenFlag}). Add it to the autostart entry, e.g. "obsidian ${this.plugin.settings.startHiddenFlag || DEFAULT_SETTINGS.startHiddenFlag}".`
+				)
+				.addText((txt) =>
+					txt
+						.setPlaceholder(DEFAULT_SETTINGS.startHiddenFlag)
+						.setValue(this.plugin.settings.startHiddenFlag)
+						.onChange(async (v) => {
+							this.plugin.settings.startHiddenFlag =
+								v.trim() || DEFAULT_SETTINGS.startHiddenFlag;
+							await this.plugin.saveSettings();
+						})
+				);
+		}
 
 		new Setting(containerEl)
 			.setName("Focus existing window on relaunch")
